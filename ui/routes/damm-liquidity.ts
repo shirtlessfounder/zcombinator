@@ -33,7 +33,6 @@ import bs58 from 'bs58';
 import BN from 'bn.js';
 import { CpAmm, getTokenProgram } from '@meteora-ag/cp-amm-sdk';
 import rateLimit from 'express-rate-limit';
-import { isWalletAuthorizedForPool } from '../lib/whitelist';
 
 /**
  * DAMM Liquidity Routes
@@ -492,39 +491,27 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
 // ============================================================================
 /**
  * Security measures:
- * 1. Lock system - Prevents concurrent operations for the same pool
- * 2. Blockhash validation - Prevents replay attacks
- * 3. Transaction structure validation - Prevents malicious instruction injection
- * 4. Manager wallet signature verification - ONLY manager wallet can submit
- * 5. Request expiry - 10 minute timeout
- * 6. Comprehensive logging
+ * 1. Authority wallet signature - Transaction must be signed by pool's authority wallet (only percent backend has keys)
+ * 2. Lock system - Prevents concurrent operations for the same pool
+ * 3. Request expiry - 10 minute timeout
+ * 4. Blockhash validation - Prevents replay attacks
+ * 5. Comprehensive logging
+ *
+ * Note: User authorization (attestation & whitelist) validated in percent backend before calling this endpoint.
  */
 
 router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res: Response) => {
   let releaseLock: (() => void) | null = null;
 
   try {
-    const { signedTransaction, requestId, creatorWallet, creatorSignature, attestationMessage } = req.body;
+    const { signedTransaction, requestId } = req.body;
 
-    console.log('DAMM withdraw confirm request received:', { requestId, creatorWallet });
+    console.log('DAMM withdraw confirm request received:', { requestId });
 
     // Validate required fields
     if (!signedTransaction || !requestId) {
       return res.status(400).json({
         error: 'Missing required fields: signedTransaction and requestId'
-      });
-    }
-
-    if (!creatorWallet) {
-      return res.status(400).json({
-        error: 'Missing required field: creatorWallet'
-      });
-    }
-
-    // Validate attestation fields (user authorization proof)
-    if (!creatorSignature || !attestationMessage) {
-      return res.status(400).json({
-        error: 'Missing required attestation fields: creatorSignature and attestationMessage'
       });
     }
 
@@ -537,68 +524,6 @@ router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res:
     }
 
     console.log('  Pool:', withdrawData.poolAddress);
-
-    // SECURITY: Validate user attestation (proves user authorized the withdrawal)
-    let attestation: { action: string; poolAddress: string; timestamp: number; nonce: string };
-    try {
-      attestation = JSON.parse(attestationMessage);
-    } catch (error) {
-      return res.status(400).json({
-        error: 'Invalid attestation format: must be valid JSON'
-      });
-    }
-
-    // Verify attestation timestamp (5-minute window to prevent replay attacks)
-    const FIVE_MINUTES = 5 * 60 * 1000;
-    if (Math.abs(Date.now() - attestation.timestamp) > FIVE_MINUTES) {
-      return res.status(400).json({
-        error: 'Attestation expired: timestamp outside 5-minute window'
-      });
-    }
-
-    // Verify attestation action matches withdrawal
-    if (attestation.action !== 'withdraw') {
-      return res.status(400).json({
-        error: 'Invalid attestation: action must be "withdraw"'
-      });
-    }
-
-    // Verify attestation pool address matches request
-    if (attestation.poolAddress !== withdrawData.poolAddress) {
-      return res.status(400).json({
-        error: 'Attestation pool address mismatch'
-      });
-    }
-
-    // SECURITY: Verify creator signature on attestation message
-    const messageBytes = new TextEncoder().encode(attestationMessage);
-    const signatureBytes = bs58.decode(creatorSignature);
-    const creatorPubKey = new PublicKey(creatorWallet);
-
-    const isCreatorSigValid = nacl.sign.detached.verify(
-      messageBytes,
-      signatureBytes,
-      creatorPubKey.toBytes()
-    );
-
-    if (!isCreatorSigValid) {
-      console.warn('Invalid creator signature on attestation:', { creatorWallet, poolAddress: withdrawData.poolAddress });
-      return res.status(403).json({
-        error: 'Invalid creator signature: attestation verification failed'
-      });
-    }
-
-    console.log('  Attestation verified:', { action: attestation.action, poolAddress: attestation.poolAddress });
-
-    // Whitelist validation: Check if the creator wallet is authorized for this pool
-    if (!isWalletAuthorizedForPool(creatorWallet, withdrawData.poolAddress)) {
-      console.warn('Unauthorized withdrawal confirm attempt:', { creatorWallet, poolAddress: withdrawData.poolAddress });
-      return res.status(403).json({
-        error: 'Wallet not authorized for this pool',
-        wallet: creatorWallet,
-        pool: withdrawData.poolAddress
-      });
-    }
 
     // Acquire lock
     releaseLock = await acquireLiquidityLock(withdrawData.poolAddress);
@@ -1224,36 +1149,28 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 // ============================================================================
 /**
  * Security measures:
- * 1. Lock system - Prevents concurrent operations for the same pool
- * 2. Transaction hash comparison - Detects any tampering with unsigned transaction
- * 3. Blockhash validation - Prevents replay attacks
- * 4. Transaction structure validation - Prevents malicious instruction injection
- *    - Manager transfers: Must go to LP owner only
- *    - LP owner transfers: Must go to pool vaults only (CRITICAL: prevents fund drainage)
- *    - Transfer amounts validated against expected maximums
- * 5. Manager wallet signature verification - ONLY manager wallet can submit
- * 6. Request expiry - 10 minute timeout
- * 7. Comprehensive logging - All security validations logged
+ * 1. Authority wallet signature - Transaction must be signed by pool's authority wallet (only percent backend has keys)
+ * 2. Lock system - Prevents concurrent operations for the same pool
+ * 3. Request expiry - 10 minute timeout
+ * 4. Blockhash validation - Prevents replay attacks
+ * 5. Transaction structure validation - Prevents malicious instruction injection
+ * 6. Comprehensive logging
+ *
+ * Note: User authorization (attestation & whitelist) validated in percent backend before calling this endpoint.
  */
 
 router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: Response) => {
   let releaseLock: (() => void) | null = null;
 
   try {
-    const { signedTransaction, requestId, creatorWallet } = req.body;
+    const { signedTransaction, requestId } = req.body;
 
-    console.log('DAMM deposit confirm request received:', { requestId, creatorWallet });
+    console.log('DAMM deposit confirm request received:', { requestId });
 
     // Validate required fields
     if (!signedTransaction || !requestId) {
       return res.status(400).json({
         error: 'Missing required fields: signedTransaction and requestId'
-      });
-    }
-
-    if (!creatorWallet) {
-      return res.status(400).json({
-        error: 'Missing required field: creatorWallet'
       });
     }
 
@@ -1267,16 +1184,6 @@ router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: 
 
     console.log('  Pool:', depositData.poolAddress);
     console.log('  Manager:', depositData.managerAddress);
-
-    // Whitelist validation: Check if the creator wallet is authorized for this pool
-    if (!isWalletAuthorizedForPool(creatorWallet, depositData.poolAddress)) {
-      console.warn('Unauthorized deposit confirm attempt:', { creatorWallet, poolAddress: depositData.poolAddress });
-      return res.status(403).json({
-        error: 'Wallet not authorized for this pool',
-        wallet: creatorWallet,
-        pool: depositData.poolAddress
-      });
-    }
 
     // Acquire lock
     releaseLock = await acquireLiquidityLock(depositData.poolAddress);
