@@ -145,6 +145,7 @@ async function testDammWithdrawApi() {
 
     console.log('  ✅ Transaction signed successfully');
     console.log('');
+    // process.exit(0);
 
     // ========================================================================
     // Step 3: Confirm withdrawal transaction
