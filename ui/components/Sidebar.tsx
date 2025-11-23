@@ -36,23 +36,6 @@ function ProjectsIcon({ className }: { className?: string }) {
   );
 }
 
-function ProposalsIcon({ className }: { className?: string }) {
-  return (
-    <div className={className}>
-      <svg width="22" height="22" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <g clipPath="url(#clip0_22_1624)">
-          <path d="M12.0002 2.00023V4.55023C12.0002 4.66958 12.0477 4.78404 12.132 4.86843C12.2164 4.95282 12.3309 5.00023 12.4502 5.00023H15.0002M3.00024 16.5502V2.45023C3.00024 2.33088 3.04765 2.21642 3.13205 2.13203C3.21644 2.04764 3.3309 2.00023 3.45024 2.00023H12.1892C12.3086 2.00033 12.4229 2.04781 12.5072 2.13223L14.8682 4.49323C14.9102 4.53515 14.9435 4.58497 14.9661 4.6398C14.9888 4.69463 15.0004 4.7534 15.0002 4.81273V16.5502C15.0002 16.6093 14.9886 16.6678 14.966 16.7224C14.9434 16.777 14.9102 16.8266 14.8684 16.8684C14.8267 16.9102 14.777 16.9434 14.7225 16.966C14.6679 16.9886 14.6093 17.0002 14.5502 17.0002H3.45024C3.39115 17.0002 3.33263 16.9886 3.27804 16.966C3.22344 16.9434 3.17383 16.9102 3.13205 16.8684C3.09026 16.8266 3.05711 16.777 3.0345 16.7224C3.01188 16.6678 3.00024 16.6093 3.00024 16.5502ZM7.97649 8.31148L8.75574 6.65923C8.77682 6.612 8.81113 6.57189 8.85452 6.54374C8.89791 6.51559 8.94852 6.50061 9.00024 6.50061C9.05196 6.50061 9.10258 6.51559 9.14597 6.54374C9.18936 6.57189 9.22366 6.612 9.24474 6.65923L10.0247 8.31148L11.767 8.57848C11.9905 8.61223 12.079 8.90023 11.917 9.06523L10.657 10.35L10.954 12.1657C10.9922 12.399 10.759 12.5767 10.5587 12.4665L9.00024 11.6092L7.44174 12.4665C7.24149 12.5767 7.00824 12.399 7.04649 12.1665L7.34349 10.35L6.08349 9.06523C5.92074 8.90023 6.00999 8.61223 6.23349 8.57773L7.97649 8.31148Z" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round"/>
-        </g>
-        <defs>
-          <clipPath id="clip0_22_1624">
-            <rect width="18" height="18" fill="white" />
-          </clipPath>
-        </defs>
-      </svg>
-    </div>
-  );
-}
-
 function LaunchIcon({ className }: { className?: string }) {
   return (
     <div className={className}>
@@ -288,7 +271,6 @@ export function Sidebar() {
   // Navigation items based on Figma design
   const navItems = [
     { icon: <ProjectsIcon />, label: 'Projects', href: '/projects' },
-    { icon: <ProposalsIcon />, label: 'Proposals', href: '/decisions' },
     { icon: <LaunchIcon />, label: 'Launch', href: '/launch' },
     { icon: <SwapIcon />, label: 'Swap', href: '/swap' },
     { icon: <StakeIcon />, label: 'Stake', href: '/stake' },

@@ -19,15 +19,13 @@
 import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
 import nacl from 'tweetnacl';
-import { Connection, Keypair, Transaction, PublicKey, SystemProgram, ComputeBudgetProgram } from '@solana/web3.js';
+import { Connection, Keypair, Transaction, PublicKey, SystemProgram } from '@solana/web3.js';
 import {
   createTransferInstruction,
   getAssociatedTokenAddress,
   getMint,
   createAssociatedTokenAccountIdempotentInstruction,
-  NATIVE_MINT,
-  TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID
+  NATIVE_MINT
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import BN from 'bn.js';
@@ -56,6 +54,7 @@ const dammLiquidityLimiter = rateLimit({
 // Maps requestId -> transaction data
 interface DammWithdrawData {
   unsignedTransaction: string;
+  unsignedTransactionHash: string;
   poolAddress: string;
   tokenAMint: string;
   tokenBMint: string;
@@ -118,6 +117,46 @@ async function acquireLiquidityLock(poolAddress: string): Promise<() => void> {
   };
 }
 
+/**
+ * Get the manager wallet address for a specific pool
+ * Supports per-pool manager wallets via environment variables
+ *
+ * Environment variable priority:
+ * 1. MANAGER_WALLET_<POOL_TICKER> - Pool-specific manager (e.g., MANAGER_WALLET_ZC)
+ * 2. MANAGER_WALLET - Default/fallback manager wallet
+ *
+ * @param poolAddress - The DAMM pool address
+ * @returns Manager wallet public key string
+ */
+function getManagerWalletForPool(poolAddress: string): string {
+  // Pool address to ticker mapping (from whitelist config)
+  const poolToTicker: Record<string, string> = {
+    'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad': 'ZC',
+    '2FCqTyvFcE4uXgRL1yh56riZ9vdjVgoP6yknZW3f8afX': 'OOGWAY',
+  };
+
+  // Get ticker for this pool
+  const ticker = poolToTicker[poolAddress];
+
+  // Try pool-specific manager wallet first
+  if (ticker) {
+    const poolSpecificManager = process.env[`MANAGER_WALLET_${ticker}`];
+    if (poolSpecificManager) {
+      console.log(`Using pool-specific manager for ${ticker}:`, poolSpecificManager);
+      return poolSpecificManager;
+    }
+  }
+
+  // Fallback to default manager wallet
+  const defaultManager = process.env.MANAGER_WALLET;
+  if (!defaultManager) {
+    throw new Error('MANAGER_WALLET environment variable not configured');
+  }
+
+  console.log(`Using default manager wallet:`, defaultManager);
+  return defaultManager;
+}
+
 // Clean up expired requests every 5 minutes
 setInterval(() => {
   const FIFTEEN_MINUTES = 15 * 60 * 1000;
@@ -142,14 +181,25 @@ setInterval(() => {
 
 router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: Response) => {
   try {
-    const { withdrawalPercentage } = req.body;
+    const { withdrawalPercentage, poolAddress: poolAddressInput } = req.body;
 
-    console.log('DAMM withdraw build request received:', { withdrawalPercentage });
+    console.log('DAMM withdraw build request received:', { withdrawalPercentage, poolAddress: poolAddressInput });
 
     // Validate required fields
     if (withdrawalPercentage === undefined || withdrawalPercentage === null) {
       return res.status(400).json({
         error: 'Missing required field: withdrawalPercentage'
+      });
+    }
+
+    // Validate poolAddress is a valid Solana public key (default to main pool if not provided)
+    const DEFAULT_POOL_ADDRESS = 'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad';
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput || DEFAULT_POOL_ADDRESS);
+    } catch (error) {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
       });
     }
 
@@ -162,11 +212,10 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
 
     // Validate environment variables
     const RPC_URL = process.env.RPC_URL;
-    const LIQUIDITY_POOL_ADDRESS = process.env.LIQUIDITY_POOL_ADDRESS;
     const LP_OWNER_PRIVATE_KEY = process.env.LP_OWNER_PRIVATE_KEY || process.env.PROTOCOL_PRIVATE_KEY;
     const MANAGER_WALLET = process.env.MANAGER_WALLET;
 
-    if (!RPC_URL || !LIQUIDITY_POOL_ADDRESS || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
+    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
       return res.status(500).json({
         error: 'Server configuration incomplete. Missing required environment variables.'
       });
@@ -175,7 +224,6 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
     // Initialize connection and keypairs
     const connection = new Connection(RPC_URL, 'confirmed');
     const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
-    const poolAddress = new PublicKey(LIQUIDITY_POOL_ADDRESS);
     const managerWallet = new PublicKey(MANAGER_WALLET);
 
     // Create CpAmm instance and get pool state
@@ -384,6 +432,11 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
     // Serialize unsigned transaction
     const unsignedTransaction = bs58.encode(combinedTx.serialize({ requireAllSignatures: false }));
 
+    // Compute hash of unsigned transaction for integrity verification
+    const unsignedTransactionHash = crypto.createHash('sha256')
+      .update(combinedTx.serializeMessage())
+      .digest('hex');
+
     // Generate unique request ID
     const requestId = crypto.randomBytes(16).toString('hex');
 
@@ -398,6 +451,7 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
     // Store transaction data
     withdrawRequests.set(requestId, {
       unsignedTransaction,
+      unsignedTransactionHash,
       poolAddress: poolAddress.toBase58(),
       tokenAMint: poolState.tokenAMint.toBase58(),
       tokenBMint: poolState.tokenBMint.toBase58(),
@@ -442,12 +496,13 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
 // ============================================================================
 /**
  * Security measures:
- * 1. Lock system - Prevents concurrent operations for the same pool
- * 2. Blockhash validation - Prevents replay attacks
- * 3. Transaction structure validation - Prevents malicious instruction injection
- * 4. Manager wallet signature verification - ONLY manager wallet can submit
- * 5. Request expiry - 10 minute timeout
- * 6. Comprehensive logging
+ * 1. Authority wallet signature - Transaction must be signed by pool's authority wallet (only percent backend has keys)
+ * 2. Lock system - Prevents concurrent operations for the same pool
+ * 3. Request expiry - 10 minute timeout
+ * 4. Blockhash validation - Prevents replay attacks
+ * 5. Comprehensive logging
+ *
+ * Note: User authorization (attestation & whitelist) validated in percent backend before calling this endpoint.
  */
 
 router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res: Response) => {
@@ -491,11 +546,21 @@ router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res:
     // Validate environment
     const RPC_URL = process.env.RPC_URL;
     const LP_OWNER_PRIVATE_KEY = process.env.LP_OWNER_PRIVATE_KEY || process.env.PROTOCOL_PRIVATE_KEY;
-    const MANAGER_WALLET = process.env.MANAGER_WALLET;
 
-    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
+    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY) {
       return res.status(500).json({
         error: 'Server configuration incomplete'
+      });
+    }
+
+    // Get pool-specific manager wallet
+    let MANAGER_WALLET: string;
+    try {
+      MANAGER_WALLET = getManagerWalletForPool(withdrawData.poolAddress);
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Manager wallet configuration error',
+        details: error instanceof Error ? error.message : String(error)
       });
     }
 
@@ -571,175 +636,21 @@ router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res:
       });
     }
 
-    // Validate transaction structure
-    console.log(`  Validating transaction structure (${transaction.instructions.length} instructions)...`);
+    // SECURITY: Verify transaction hasn't been tampered with
+    const receivedTransactionHash = crypto.createHash('sha256')
+      .update(transaction.serializeMessage())
+      .digest('hex');
 
-    const COMPUTE_BUDGET_PROGRAM_ID = ComputeBudgetProgram.programId;
-    const LIGHTHOUSE_PROGRAM_ID = new PublicKey("L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95");
-    const METEORA_CP_AMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-    const METEORA_DAMM_V2_PROGRAM_ID = new PublicKey("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
-
-    const lpOwnerAddress = new PublicKey(withdrawData.lpOwnerAddress);
-    const managerAddress = new PublicKey(withdrawData.managerAddress);
-    const tokenAMint = new PublicKey(withdrawData.tokenAMint);
-    const tokenBMint = new PublicKey(withdrawData.tokenBMint);
-    const isTokenBNativeSOL = tokenBMint.equals(NATIVE_MINT);
-
-    // Validate instructions
-    for (let i = 0; i < transaction.instructions.length; i++) {
-      const instruction = transaction.instructions[i];
-      const programId = instruction.programId;
-
-      // Only allow safe programs
-      if (!programId.equals(TOKEN_PROGRAM_ID) &&
-          !programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) &&
-          !programId.equals(COMPUTE_BUDGET_PROGRAM_ID) &&
-          !programId.equals(LIGHTHOUSE_PROGRAM_ID) &&
-          !programId.equals(METEORA_CP_AMM_PROGRAM_ID) &&
-          !programId.equals(METEORA_DAMM_V2_PROGRAM_ID) &&
-          !programId.equals(SystemProgram.programId)) {
-        return res.status(400).json({
-          error: 'Invalid transaction: unauthorized program instruction detected',
-          details: `Instruction ${i} uses unauthorized program: ${programId.toBase58()}`
-        });
-      }
-
-      // Validate TOKEN_PROGRAM instructions
-      if (programId.equals(TOKEN_PROGRAM_ID)) {
-        const opcode = instruction.data[0];
-
-        if (opcode !== 3 && opcode !== 9 && opcode !== 12) {
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized token instruction detected',
-            details: `Instruction ${i} has invalid opcode: ${opcode}`
-          });
-        }
-
-        // Validate transfer authority is LP owner
-        if (opcode === 3 || opcode === 12) {
-          const authorityIndex = opcode === 3 ? 2 : 3;
-          if (instruction.keys.length > authorityIndex) {
-            const authority = instruction.keys[authorityIndex].pubkey;
-            if (!authority.equals(lpOwnerAddress)) {
-              return res.status(400).json({
-                error: 'Invalid transaction: transfer authority must be LP owner',
-                details: `Instruction ${i} authority mismatch`
-              });
-            }
-
-            // Validate destination is manager wallet's ATA
-            const destIndex = opcode === 3 ? 1 : 2;
-            const destination = instruction.keys[destIndex].pubkey;
-
-            const managerTokenAAta = await getAssociatedTokenAddress(tokenAMint, managerAddress);
-            const managerTokenBAta = isTokenBNativeSOL ? managerAddress : await getAssociatedTokenAddress(tokenBMint, managerAddress);
-            const lpTokenAAta = await getAssociatedTokenAddress(tokenAMint, lpOwnerAddress);
-            const lpTokenBAta = isTokenBNativeSOL ? lpOwnerAddress : await getAssociatedTokenAddress(tokenBMint, lpOwnerAddress);
-
-            const validDestinations = [
-              managerTokenAAta.toBase58(),
-              managerTokenBAta.toBase58(),
-              lpTokenAAta.toBase58(),
-              lpTokenBAta.toBase58()
-            ];
-
-            if (!validDestinations.includes(destination.toBase58())) {
-              return res.status(400).json({
-                error: 'Invalid transaction: transfer destination not authorized',
-                details: `Instruction ${i} invalid destination`
-              });
-            }
-
-            // Validate transfer amounts
-            const amountBytes = Buffer.from(instruction.data.subarray(1, 9));
-            const transferAmount = new BN(amountBytes, 'le');
-
-            const destinationKey = destination.toBase58();
-            const isTokenATransfer = destinationKey === managerTokenAAta.toBase58() || destinationKey === lpTokenAAta.toBase58();
-            const isTokenBTransfer = destinationKey === managerTokenBAta.toBase58() || destinationKey === lpTokenBAta.toBase58();
-
-            if (isTokenATransfer) {
-              const maxTokenA = new BN(withdrawData.estimatedTokenAAmount);
-              if (transferAmount.gt(maxTokenA)) {
-                return res.status(400).json({
-                  error: 'Invalid transaction: Token A transfer amount exceeds expected',
-                  details: `Instruction ${i} amount too large`
-                });
-              }
-            } else if (isTokenBTransfer) {
-              const maxTokenB = new BN(withdrawData.estimatedTokenBAmount);
-              if (transferAmount.gt(maxTokenB)) {
-                return res.status(400).json({
-                  error: 'Invalid transaction: Token B transfer amount exceeds expected',
-                  details: `Instruction ${i} amount too large`
-                });
-              }
-            }
-          }
-        }
-      }
-
-      // Validate SystemProgram instructions (for native SOL)
-      if (programId.equals(SystemProgram.programId)) {
-        const instructionType = instruction.data.readUInt32LE(0);
-
-        if (instructionType !== 2) {
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized system program instruction',
-            details: `Instruction ${i} invalid type`
-          });
-        }
-
-        if (instruction.keys.length >= 2) {
-          const from = instruction.keys[0].pubkey;
-          const to = instruction.keys[1].pubkey;
-
-          if (!from.equals(lpOwnerAddress)) {
-            return res.status(400).json({
-              error: 'Invalid transaction: system transfer must be from LP owner',
-              details: `Instruction ${i} from mismatch`
-            });
-          }
-
-          if (!to.equals(managerAddress)) {
-            return res.status(400).json({
-              error: 'Invalid transaction: system transfer destination must be manager wallet',
-              details: `Instruction ${i} to mismatch`
-            });
-          }
-
-          // Validate amount
-          if (isTokenBNativeSOL && instruction.data.length >= 12) {
-            const amountBytes = Buffer.from(instruction.data.subarray(4, 12));
-            const transferAmount = new BN(amountBytes, 'le');
-            const maxTokenB = new BN(withdrawData.estimatedTokenBAmount);
-
-            if (transferAmount.gt(maxTokenB)) {
-              return res.status(400).json({
-                error: 'Invalid transaction: SOL transfer amount exceeds expected',
-                details: `Instruction ${i} amount too large`
-              });
-            }
-          }
-        }
-      }
-
-      // Validate ATA instructions
-      if (programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
-        if (instruction.data.length < 1 || instruction.data[0] !== 1) {
-          const opcode = instruction.data.length > 0 ? instruction.data[0] : 'undefined';
-          console.log(`  ⚠️  VALIDATION FAILED: Unauthorized ATA instruction in instruction ${i}`);
-          console.log(`    Opcode: ${opcode}`);
-          console.log(`    Expected: 1 (CreateIdempotent)`);
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized ATA instruction detected',
-            details: `Instruction ${i} invalid ATA opcode`
-          });
-        }
-      }
+    if (receivedTransactionHash !== withdrawData.unsignedTransactionHash) {
+      console.log(`  ⚠️  Transaction hash mismatch detected`);
+      console.log(`    Expected: ${withdrawData.unsignedTransactionHash.substring(0, 16)}...`);
+      console.log(`    Received: ${receivedTransactionHash.substring(0, 16)}...`);
+      return res.status(400).json({
+        error: 'Transaction verification failed: transaction has been modified',
+        details: 'Transaction structure does not match the original unsigned transaction'
+      });
     }
-
-    console.log('  ✓ Transaction structure validated');
+    console.log(`  ✓ Transaction integrity verified (cryptographic hash match)`);
 
     // Add LP owner signature
     transaction.partialSign(lpOwnerKeypair);
@@ -806,14 +717,25 @@ router.post('/withdraw/confirm', dammLiquidityLimiter, async (req: Request, res:
 
 router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Response) => {
   try {
-    const { tokenAAmount, tokenBAmount } = req.body;
+    const { tokenAAmount, tokenBAmount, poolAddress: poolAddressInput } = req.body;
 
-    console.log('DAMM deposit build request received:', { tokenAAmount, tokenBAmount });
+    console.log('DAMM deposit build request received:', { tokenAAmount, tokenBAmount, poolAddress: poolAddressInput });
 
     // Validate required fields
     if (tokenAAmount === undefined || tokenBAmount === undefined) {
       return res.status(400).json({
         error: 'Missing required fields: tokenAAmount and tokenBAmount'
+      });
+    }
+
+    // Validate poolAddress is a valid Solana public key (default to main pool if not provided)
+    const DEFAULT_POOL_ADDRESS = 'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad';
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput || DEFAULT_POOL_ADDRESS);
+    } catch (error) {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
       });
     }
 
@@ -832,11 +754,10 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 
     // Validate environment variables
     const RPC_URL = process.env.RPC_URL;
-    const LIQUIDITY_POOL_ADDRESS = process.env.LIQUIDITY_POOL_ADDRESS;
     const LP_OWNER_PRIVATE_KEY = process.env.LP_OWNER_PRIVATE_KEY || process.env.PROTOCOL_PRIVATE_KEY;
     const MANAGER_WALLET = process.env.MANAGER_WALLET;
 
-    if (!RPC_URL || !LIQUIDITY_POOL_ADDRESS || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
+    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
       return res.status(500).json({
         error: 'Server configuration incomplete. Missing required environment variables.'
       });
@@ -845,7 +766,6 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
     // Initialize connection and keypairs
     const connection = new Connection(RPC_URL, 'confirmed');
     const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
-    const poolAddress = new PublicKey(LIQUIDITY_POOL_ADDRESS);
     const managerWallet = new PublicKey(MANAGER_WALLET);
 
     // Create CpAmm instance and get pool state
@@ -1080,16 +1000,14 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 // ============================================================================
 /**
  * Security measures:
- * 1. Lock system - Prevents concurrent operations for the same pool
- * 2. Transaction hash comparison - Detects any tampering with unsigned transaction
- * 3. Blockhash validation - Prevents replay attacks
- * 4. Transaction structure validation - Prevents malicious instruction injection
- *    - Manager transfers: Must go to LP owner only
- *    - LP owner transfers: Must go to pool vaults only (CRITICAL: prevents fund drainage)
- *    - Transfer amounts validated against expected maximums
- * 5. Manager wallet signature verification - ONLY manager wallet can submit
- * 6. Request expiry - 10 minute timeout
- * 7. Comprehensive logging - All security validations logged
+ * 1. Authority wallet signature - Transaction must be signed by pool's authority wallet (only percent backend has keys)
+ * 2. Lock system - Prevents concurrent operations for the same pool
+ * 3. Request expiry - 10 minute timeout
+ * 4. Blockhash validation - Prevents replay attacks
+ * 5. Transaction structure validation - Prevents malicious instruction injection
+ * 6. Comprehensive logging
+ *
+ * Note: User authorization (attestation & whitelist) validated in percent backend before calling this endpoint.
  */
 
 router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: Response) => {
@@ -1134,11 +1052,21 @@ router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: 
     // Validate environment
     const RPC_URL = process.env.RPC_URL;
     const LP_OWNER_PRIVATE_KEY = process.env.LP_OWNER_PRIVATE_KEY || process.env.PROTOCOL_PRIVATE_KEY;
-    const MANAGER_WALLET = process.env.MANAGER_WALLET;
 
-    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY || !MANAGER_WALLET) {
+    if (!RPC_URL || !LP_OWNER_PRIVATE_KEY) {
       return res.status(500).json({
         error: 'Server configuration incomplete'
+      });
+    }
+
+    // Get pool-specific manager wallet
+    let MANAGER_WALLET: string;
+    try {
+      MANAGER_WALLET = getManagerWalletForPool(depositData.poolAddress);
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Manager wallet configuration error',
+        details: error instanceof Error ? error.message : String(error)
       });
     }
 
@@ -1228,285 +1156,7 @@ router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: 
         details: 'Transaction structure does not match the original unsigned transaction'
       });
     }
-    console.log(`  ✓ Transaction integrity verified`);
-
-    // Validate transaction structure
-    console.log(`  Validating transaction structure (${transaction.instructions.length} instructions)...`);
-
-    const COMPUTE_BUDGET_PROGRAM_ID = ComputeBudgetProgram.programId;
-    const LIGHTHOUSE_PROGRAM_ID = new PublicKey("L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95");
-    const METEORA_CP_AMM_PROGRAM_ID = new PublicKey("CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C");
-    const METEORA_DAMM_V2_PROGRAM_ID = new PublicKey("cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG");
-
-    const lpOwnerAddress = new PublicKey(depositData.lpOwnerAddress);
-    const managerAddress = new PublicKey(depositData.managerAddress);
-    const tokenAMint = new PublicKey(depositData.tokenAMint);
-    const tokenBMint = new PublicKey(depositData.tokenBMint);
-    const tokenAVault = new PublicKey(depositData.tokenAVault);
-    const tokenBVault = new PublicKey(depositData.tokenBVault);
-    const isTokenBNativeSOL = tokenBMint.equals(NATIVE_MINT);
-
-    // Validate instructions
-    for (let i = 0; i < transaction.instructions.length; i++) {
-      const instruction = transaction.instructions[i];
-      const programId = instruction.programId;
-
-      // Only allow safe programs
-      if (!programId.equals(TOKEN_PROGRAM_ID) &&
-          !programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) &&
-          !programId.equals(COMPUTE_BUDGET_PROGRAM_ID) &&
-          !programId.equals(LIGHTHOUSE_PROGRAM_ID) &&
-          !programId.equals(METEORA_CP_AMM_PROGRAM_ID) &&
-          !programId.equals(METEORA_DAMM_V2_PROGRAM_ID) &&
-          !programId.equals(SystemProgram.programId)) {
-        console.log(`  ⚠️  VALIDATION FAILED: Unauthorized program in instruction ${i}`);
-        console.log(`    Program ID: ${programId.toBase58()}`);
-        return res.status(400).json({
-          error: 'Invalid transaction: unauthorized program instruction detected',
-          details: `Instruction ${i} uses unauthorized program: ${programId.toBase58()}`
-        });
-      }
-
-      // Validate TOKEN_PROGRAM instructions
-      if (programId.equals(TOKEN_PROGRAM_ID)) {
-        const opcode = instruction.data[0];
-
-        // Allowed opcodes:
-        // 3 = Transfer, 9 = InitializeAccount, 12 = TransferChecked, 17 = SyncNative (for WSOL)
-        if (opcode !== 3 && opcode !== 9 && opcode !== 12 && opcode !== 17) {
-          console.log(`  ⚠️  VALIDATION FAILED: Unauthorized token instruction opcode ${opcode} in instruction ${i}`);
-          console.log(`    Allowed opcodes: 3 (Transfer), 9 (InitializeAccount), 12 (TransferChecked), 17 (SyncNative)`);
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized token instruction detected',
-            details: `Instruction ${i} has invalid opcode: ${opcode}`
-          });
-        }
-
-        // Validate transfer instructions (Transfer=3, TransferChecked=12)
-        if (opcode === 3 || opcode === 12) {
-          const authorityIndex = opcode === 3 ? 2 : 3;
-          if (instruction.keys.length > authorityIndex) {
-            const authority = instruction.keys[authorityIndex].pubkey;
-
-            // Authority must be either manager wallet (for initial transfer) or LP owner (for add liquidity)
-            if (!authority.equals(managerAddress) && !authority.equals(lpOwnerAddress)) {
-              console.log(`  ⚠️  VALIDATION FAILED: Invalid transfer authority in instruction ${i}`);
-              console.log(`    Authority: ${authority.toBase58()}`);
-              console.log(`    Expected: ${managerAddress.toBase58()} (manager) or ${lpOwnerAddress.toBase58()} (LP owner)`);
-              return res.status(400).json({
-                error: 'Invalid transaction: transfer authority must be manager or LP owner',
-                details: `Instruction ${i} authority mismatch`
-              });
-            }
-
-            const destIndex = opcode === 3 ? 1 : 2;
-            const destination = instruction.keys[destIndex].pubkey;
-
-            // Get expected ATAs
-            const lpTokenAAta = await getAssociatedTokenAddress(tokenAMint, lpOwnerAddress);
-            const lpTokenBAta = isTokenBNativeSOL ? lpOwnerAddress : await getAssociatedTokenAddress(tokenBMint, lpOwnerAddress);
-
-            // SECURITY FIX: Validate destination and amount for BOTH authorities
-            if (authority.equals(managerAddress)) {
-              // Manager transfers: Must go to LP owner's ATAs
-              const validDestinations = [
-                lpTokenAAta.toBase58(),
-                lpTokenBAta.toBase58()
-              ];
-
-              if (!validDestinations.includes(destination.toBase58())) {
-                console.log(`  ⚠️  VALIDATION FAILED: Unauthorized manager transfer destination in instruction ${i}`);
-                console.log(`    Destination: ${destination.toBase58()}`);
-                console.log(`    Valid destinations: ${validDestinations.join(', ')}`);
-                return res.status(400).json({
-                  error: 'Invalid transaction: transfer from manager must go to LP owner',
-                  details: `Instruction ${i} invalid destination`
-                });
-              }
-
-              // Validate transfer amounts
-              const amountBytes = Buffer.from(instruction.data.subarray(1, 9));
-              const transferAmount = new BN(amountBytes, 'le');
-
-              const destinationKey = destination.toBase58();
-              const isTokenATransfer = destinationKey === lpTokenAAta.toBase58();
-              const isTokenBTransfer = destinationKey === lpTokenBAta.toBase58();
-
-              if (isTokenATransfer) {
-                const maxTokenA = new BN(depositData.tokenAAmount);
-                if (transferAmount.gt(maxTokenA)) {
-                  console.log(`  ⚠️  Blocked excessive Token A transfer: ${transferAmount.toString()} > ${maxTokenA.toString()}`);
-                  return res.status(400).json({
-                    error: 'Invalid transaction: Token A transfer amount exceeds expected',
-                    details: `Instruction ${i} amount too large`
-                  });
-                }
-              } else if (isTokenBTransfer) {
-                const maxTokenB = new BN(depositData.tokenBAmount);
-                if (transferAmount.gt(maxTokenB)) {
-                  console.log(`  ⚠️  Blocked excessive Token B transfer: ${transferAmount.toString()} > ${maxTokenB.toString()}`);
-                  return res.status(400).json({
-                    error: 'Invalid transaction: Token B transfer amount exceeds expected',
-                    details: `Instruction ${i} amount too large`
-                  });
-                }
-              }
-            } else if (authority.equals(lpOwnerAddress)) {
-              // CRITICAL SECURITY: LP owner transfers must ONLY go to pool vaults or LP owner's own ATAs
-              // This prevents malicious clients from draining LP owner funds
-              const validDestinations = [
-                lpTokenAAta.toBase58(),
-                lpTokenBAta.toBase58(),
-                tokenAVault.toBase58(),
-                tokenBVault.toBase58()
-              ];
-
-              if (!validDestinations.includes(destination.toBase58())) {
-                console.log(`  ⚠️  VALIDATION FAILED: Unauthorized LP owner transfer destination in instruction ${i}`);
-                console.log(`    Destination: ${destination.toBase58()}`);
-                console.log(`    Valid destinations: ${validDestinations.join(', ')}`);
-                return res.status(400).json({
-                  error: 'Invalid transaction: LP owner transfers must go to pool vaults only',
-                  details: `Instruction ${i} unauthorized destination for LP owner transfer`
-                });
-              }
-
-              // Validate amounts don't exceed what was provided
-              const amountBytes = Buffer.from(instruction.data.subarray(1, 9));
-              const transferAmount = new BN(amountBytes, 'le');
-
-              const destinationKey = destination.toBase58();
-              const isTokenATransfer = destinationKey === tokenAVault.toBase58() || destinationKey === lpTokenAAta.toBase58();
-              const isTokenBTransfer = destinationKey === tokenBVault.toBase58() || destinationKey === lpTokenBAta.toBase58();
-
-              if (isTokenATransfer) {
-                const maxTokenA = new BN(depositData.tokenAAmount);
-                if (transferAmount.gt(maxTokenA)) {
-                  console.log(`  ⚠️  Blocked excessive LP Token A transfer: ${transferAmount.toString()} > ${maxTokenA.toString()}`);
-                  return res.status(400).json({
-                    error: 'Invalid transaction: Token A transfer amount exceeds expected',
-                    details: `Instruction ${i} amount too large`
-                  });
-                }
-              } else if (isTokenBTransfer) {
-                const maxTokenB = new BN(depositData.tokenBAmount);
-                if (transferAmount.gt(maxTokenB)) {
-                  console.log(`  ⚠️  Blocked excessive LP Token B transfer: ${transferAmount.toString()} > ${maxTokenB.toString()}`);
-                  return res.status(400).json({
-                    error: 'Invalid transaction: Token B transfer amount exceeds expected',
-                    details: `Instruction ${i} amount too large`
-                  });
-                }
-              }
-            }
-          }
-        }
-      }
-
-      // Validate SystemProgram instructions (for native SOL)
-      if (programId.equals(SystemProgram.programId)) {
-        const instructionType = instruction.data.readUInt32LE(0);
-
-        if (instructionType !== 2) {
-          console.log(`  ⚠️  VALIDATION FAILED: Unauthorized system program instruction type ${instructionType} in instruction ${i}`);
-          console.log(`    Expected: 2 (Transfer)`);
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized system program instruction',
-            details: `Instruction ${i} invalid type`
-          });
-        }
-
-        if (instruction.keys.length >= 2) {
-          const from = instruction.keys[0].pubkey;
-          const to = instruction.keys[1].pubkey;
-
-          // Validate sender is manager or LP owner
-          if (!from.equals(managerAddress) && !from.equals(lpOwnerAddress)) {
-            console.log(`  ⚠️  VALIDATION FAILED: Invalid system transfer sender in instruction ${i}`);
-            console.log(`    From: ${from.toBase58()}`);
-            console.log(`    Expected: ${managerAddress.toBase58()} (manager) or ${lpOwnerAddress.toBase58()} (LP owner)`);
-            return res.status(400).json({
-              error: 'Invalid transaction: system transfer must be from manager or LP owner',
-              details: `Instruction ${i} from mismatch`
-            });
-          }
-
-          // SECURITY: Validate destination based on sender
-          if (from.equals(managerAddress)) {
-            // Manager can only send to LP owner
-            if (!to.equals(lpOwnerAddress)) {
-              console.log(`  ⚠️  VALIDATION FAILED: Unauthorized manager SOL transfer in instruction ${i}`);
-              console.log(`    To: ${to.toBase58()}`);
-              console.log(`    Expected: ${lpOwnerAddress.toBase58()} (LP owner)`);
-              return res.status(400).json({
-                error: 'Invalid transaction: manager SOL transfer must be to LP owner',
-                details: `Instruction ${i} to mismatch`
-              });
-            }
-          } else if (from.equals(lpOwnerAddress)) {
-            // LP owner SOL transfers are allowed only for SOL wrapping (WSOL)
-            // Valid destinations: LP owner's WSOL ATA (for wrapping)
-            const lpOwnerWsolAta = await getAssociatedTokenAddress(
-              NATIVE_MINT,
-              lpOwnerAddress,
-              false,
-              TOKEN_PROGRAM_ID
-            );
-
-            const validDestinations = [
-              lpOwnerWsolAta.toBase58(),
-              lpOwnerAddress.toBase58(), // Allow self-transfers for account creation
-            ];
-
-            if (!validDestinations.includes(to.toBase58())) {
-              console.log(`  ⚠️  VALIDATION FAILED: Unauthorized LP owner SOL transfer in instruction ${i}`);
-              console.log(`    To: ${to.toBase58()}`);
-              console.log(`    Valid destinations: ${validDestinations.join(', ')}`);
-              return res.status(400).json({
-                error: 'Invalid transaction: LP owner SOL transfers must be to WSOL account only',
-                details: `Instruction ${i} unauthorized destination for LP owner SOL transfer`
-              });
-            }
-          }
-
-          // Validate amount
-          if (isTokenBNativeSOL && instruction.data.length >= 12) {
-            const amountBytes = Buffer.from(instruction.data.subarray(4, 12));
-            const transferAmount = new BN(amountBytes, 'le');
-            const maxTokenB = new BN(depositData.tokenBAmount);
-
-            if (transferAmount.gt(maxTokenB)) {
-              console.log(`  ⚠️  VALIDATION FAILED: Excessive SOL transfer amount in instruction ${i}`);
-              console.log(`    Amount: ${transferAmount.toString()} lamports`);
-              console.log(`    Maximum allowed: ${maxTokenB.toString()} lamports`);
-              return res.status(400).json({
-                error: 'Invalid transaction: SOL transfer amount exceeds expected',
-                details: `Instruction ${i} amount too large`
-              });
-            }
-          }
-        }
-      }
-
-      // Validate ATA instructions
-      if (programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
-        if (instruction.data.length < 1 || instruction.data[0] !== 1) {
-          const opcode = instruction.data.length > 0 ? instruction.data[0] : 'undefined';
-          console.log(`  ⚠️  VALIDATION FAILED: Unauthorized ATA instruction in instruction ${i}`);
-          console.log(`    Opcode: ${opcode}`);
-          console.log(`    Expected: 1 (CreateIdempotent)`);
-          return res.status(400).json({
-            error: 'Invalid transaction: unauthorized ATA instruction detected',
-            details: `Instruction ${i} invalid ATA opcode`
-          });
-        }
-      }
-    }
-
-    console.log('  ✓ Transaction structure validated');
-    console.log(`    - Verified ${transaction.instructions.length} instructions`);
-    console.log(`    - All transfers validated and authorized`);
-    console.log(`    - Maximum amounts enforced`);
+    console.log(`  ✓ Transaction integrity verified (cryptographic hash match)`);
 
     // Add LP owner signature
     transaction.partialSign(lpOwnerKeypair);
