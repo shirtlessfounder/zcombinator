@@ -355,6 +355,23 @@ router.post('/:tokenAddress/purchase/prepare', async (req: Request, res: Respons
   let releaseLock: (() => void) | null = null;
 
   try {
+    // API Key validation
+    const apiKey = req.headers['x-api-key'];
+    const validApiKey = process.env.ZC_API_KEY;
+
+    if (!validApiKey) {
+      console.error('ZC_API_KEY not configured in environment');
+      return res.status(500).json({
+        error: 'API authentication not configured'
+      });
+    }
+
+    if (!apiKey || apiKey !== validApiKey) {
+      return res.status(401).json({
+        error: 'Unauthorized - Invalid or missing API key'
+      });
+    }
+
     const { tokenAddress } = req.params;
     const { wallet, solAmount } = req.body;
 
@@ -445,6 +462,23 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
   let releaseLock: (() => void) | null = null;
 
   try {
+    // API Key validation
+    const apiKey = req.headers['x-api-key'];
+    const validApiKey = process.env.ZC_API_KEY;
+
+    if (!validApiKey) {
+      console.error('ZC_API_KEY not configured in environment');
+      return res.status(500).json({
+        error: 'API authentication not configured'
+      });
+    }
+
+    if (!apiKey || apiKey !== validApiKey) {
+      return res.status(401).json({
+        error: 'Unauthorized - Invalid or missing API key'
+      });
+    }
+
     const { tokenAddress } = req.params;
     const {
       icoSaleId,
@@ -826,10 +860,14 @@ router.get('/:tokenAddress/claim', async (req: Request, res: Response) => {
 
     const claimInfo = await getUserClaimInfo(tokenAddress, wallet);
 
+    // Get ICO sale to include token_decimals
+    const icoSale = await getIcoSaleByTokenAddress(tokenAddress);
+
     if (!claimInfo) {
       return res.json({
         tokens_claimable: '0',
         tokens_claimed: '0',
+        token_decimals: icoSale?.token_decimals || 9,
       });
     }
 
@@ -837,6 +875,7 @@ router.get('/:tokenAddress/claim', async (req: Request, res: Response) => {
       tokens_claimable: (claimInfo.tokens_claimable || BigInt(0)).toString(),
       tokens_claimed: claimInfo.tokens_claimed.toString(),
       claimed_at: claimInfo.claimed_at,
+      token_decimals: icoSale?.token_decimals || 9,
     });
   } catch (error) {
     console.error('Error fetching claim info:', error);

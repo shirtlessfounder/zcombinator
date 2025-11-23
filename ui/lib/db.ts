@@ -603,6 +603,7 @@ export async function initializeDatabase(): Promise<void> {
       token_metadata_url TEXT NOT NULL,
       total_tokens_for_sale BIGINT NOT NULL,
       token_price_sol TEXT NOT NULL,
+      token_decimals INTEGER NOT NULL DEFAULT 9,
       status TEXT DEFAULT 'active' NOT NULL CHECK (status IN ('active', 'finalized')),
       escrow_pub_key TEXT,
       escrow_priv_key TEXT,
@@ -616,6 +617,17 @@ export async function initializeDatabase(): Promise<void> {
     CREATE INDEX IF NOT EXISTS idx_ico_sales_creator_wallet ON ico_sales(creator_wallet);
     CREATE INDEX IF NOT EXISTS idx_ico_sales_status ON ico_sales(status);
     CREATE INDEX IF NOT EXISTS idx_ico_sales_created_at ON ico_sales(created_at DESC);
+
+    -- Add token_decimals column if it doesn't exist (migration)
+    DO $$
+    BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM information_schema.columns
+        WHERE table_name = 'ico_sales' AND column_name = 'token_decimals'
+      ) THEN
+        ALTER TABLE ico_sales ADD COLUMN token_decimals INTEGER NOT NULL DEFAULT 9;
+      END IF;
+    END $$;
 
     CREATE TABLE IF NOT EXISTS ico_purchases (
       id SERIAL PRIMARY KEY,

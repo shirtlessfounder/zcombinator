@@ -147,15 +147,19 @@ export async function createNewIcoSale(params: {
  */
 export function calculateTokensForSol(
   solAmountLamports: bigint,
-  tokenPriceSol: string
+  tokenPriceSol: string,
+  tokenDecimals: number
 ): bigint {
-  // tokenPriceSol is like "0.00001428571" (SOL per token)
-  // Convert to price in lamports per token
+  // tokenPriceSol is the price per 1 human-readable token (e.g., "0.0001" SOL per token)
+  // We need to return raw token amount (with decimals included)
+
   const priceFloat = parseFloat(tokenPriceSol);
   const lamportsPerToken = BigInt(Math.floor(priceFloat * 1_000_000_000));
 
-  // tokens = solAmount / pricePerToken
-  const tokens = (solAmountLamports * BigInt(1_000_000_000)) / lamportsPerToken;
+  // Calculate: (solAmount / price) * 10^tokenDecimals
+  // Rearranged: (solAmount * 10^tokenDecimals) / lamportsPerToken
+  const decimalMultiplier = BigInt(Math.pow(10, tokenDecimals));
+  const tokens = (solAmountLamports * decimalMultiplier) / lamportsPerToken;
 
   return tokens;
 }
@@ -165,15 +169,19 @@ export function calculateTokensForSol(
  */
 export function calculateSolForTokens(
   tokenAmount: bigint,
-  tokenPriceSol: string
+  tokenPriceSol: string,
+  tokenDecimals: number
 ): bigint {
-  // tokenPriceSol is like "0.00001428571" (SOL per token)
-  // Convert to price in lamports per token
+  // tokenPriceSol is the price per 1 human-readable token
+  // tokenAmount is in raw units (with decimals included)
+
   const priceFloat = parseFloat(tokenPriceSol);
   const lamportsPerToken = BigInt(Math.floor(priceFloat * 1_000_000_000));
 
-  // solAmount = tokens * pricePerToken
-  const solAmount = (tokenAmount * lamportsPerToken) / BigInt(1_000_000_000);
+  // Calculate: (tokenAmount / 10^tokenDecimals) * price
+  // Rearranged: (tokenAmount * lamportsPerToken) / 10^tokenDecimals
+  const decimalDivisor = BigInt(Math.pow(10, tokenDecimals));
+  const solAmount = (tokenAmount * lamportsPerToken) / decimalDivisor;
 
   return solAmount;
 }
@@ -219,8 +227,11 @@ export async function preparePurchaseTransaction(params: {
     throw new Error('ICO sale ID is missing');
   }
 
+  // Get token decimals from database (with fallback to 9 for backwards compatibility)
+  const tokenDecimals = icoSale.token_decimals || 9;
+
   // Calculate tokens based on SOL amount requested
-  const tokensRequested = calculateTokensForSol(params.solAmountLamports, icoSale.token_price_sol);
+  const tokensRequested = calculateTokensForSol(params.solAmountLamports, icoSale.token_price_sol, tokenDecimals);
 
   // Check tokens remaining and cap purchase to available amount
   const tokensRemainingForSale = icoSale.total_tokens_for_sale - icoSale.tokens_sold;
@@ -235,7 +246,7 @@ export async function preparePurchaseTransaction(params: {
   // Calculate actual SOL amount needed for the capped token amount
   const actualSolAmount = tokensBought === tokensRequested
     ? params.solAmountLamports
-    : calculateSolForTokens(tokensBought, icoSale.token_price_sol);
+    : calculateSolForTokens(tokensBought, icoSale.token_price_sol, tokenDecimals);
 
   const tokensToVault = (tokensBought * BigInt(VAULT_PERCENTAGE)) / BigInt(100);
   const tokensClaimable = tokensBought - tokensToVault;
