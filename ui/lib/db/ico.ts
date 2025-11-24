@@ -473,7 +473,7 @@ export async function getIcoClaimByWallet(
   const query = `
     SELECT
       c.*,
-      COALESCE(SUM(p.tokens_bought) / 2, 0) as tokens_claimable
+      COALESCE(SUM(p.tokens_bought)::bigint / 2, 0) as tokens_claimable
     FROM ico_claims c
     JOIN ico_sales s ON c.ico_sale_id = s.id
     LEFT JOIN ico_purchases p ON p.ico_sale_id = c.ico_sale_id AND p.wallet_address = c.wallet_address
@@ -488,8 +488,8 @@ export async function getIcoClaimByWallet(
     const row = result.rows[0];
     return {
       ...row,
-      tokens_claimable: BigInt(row.tokens_claimable),
-      tokens_claimed: BigInt(row.tokens_claimed),
+      tokens_claimable: BigInt(Math.floor(parseFloat(row.tokens_claimable))),
+      tokens_claimed: BigInt(Math.floor(parseFloat(row.tokens_claimed))),
     };
   } catch (error) {
     console.error('Error fetching ICO claim:', error);
@@ -532,7 +532,7 @@ export async function updateIcoClaim(
       )
       SELECT
         c.*,
-        COALESCE(SUM(p.tokens_bought) / 2, 0) as tokens_claimable
+        COALESCE(SUM(p.tokens_bought)::bigint / 2, 0) as tokens_claimable
       FROM updated c
       LEFT JOIN ico_purchases p ON p.ico_sale_id = c.ico_sale_id AND p.wallet_address = c.wallet_address
       GROUP BY c.id, c.ico_sale_id, c.wallet_address, c.tokens_claimed, c.claim_transaction_signature, c.claimed_at, c.created_at, c.updated_at
@@ -550,8 +550,8 @@ export async function updateIcoClaim(
     const row = result.rows[0];
     return {
       ...row,
-      tokens_claimable: BigInt(row.tokens_claimable),
-      tokens_claimed: BigInt(row.tokens_claimed),
+      tokens_claimable: BigInt(Math.floor(parseFloat(row.tokens_claimable))),
+      tokens_claimed: BigInt(Math.floor(parseFloat(row.tokens_claimed))),
     };
   } catch (error) {
     console.error('Error updating ICO claim:', error);
@@ -566,7 +566,7 @@ export async function getAllIcoClaims(
   const query = `
     SELECT
       c.*,
-      COALESCE(SUM(p.tokens_bought) / 2, 0) as tokens_claimable
+      COALESCE(SUM(p.tokens_bought)::bigint / 2, 0) as tokens_claimable
     FROM ico_claims c
     JOIN ico_sales s ON c.ico_sale_id = s.id
     LEFT JOIN ico_purchases p ON p.ico_sale_id = c.ico_sale_id AND p.wallet_address = c.wallet_address
@@ -579,8 +579,8 @@ export async function getAllIcoClaims(
     const result = await pool.query(query, [tokenAddress]);
     return result.rows.map((row) => ({
       ...row,
-      tokens_claimable: BigInt(row.tokens_claimable),
-      tokens_claimed: BigInt(row.tokens_claimed),
+      tokens_claimable: BigInt(Math.floor(parseFloat(row.tokens_claimable))),
+      tokens_claimed: BigInt(Math.floor(parseFloat(row.tokens_claimed))),
     }));
   } catch (error) {
     console.error('Error fetching all ICO claims:', error);

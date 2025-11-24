@@ -17,7 +17,7 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { Connection, PublicKey, Transaction } from '@solana/web3.js';
+import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import * as nacl from 'tweetnacl';
 import * as crypto from 'crypto';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
@@ -457,22 +457,13 @@ router.post('/:tokenAddress/purchase/prepare', async (req: Request, res: Respons
       solAmountLamports,
     });
 
-    // SECURITY: Set recent blockhash to prevent replay attacks
-    const connection = new Connection(RPC_URL, 'confirmed');
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    result.transaction.recentBlockhash = blockhash;
-    result.transaction.feePayer = new PublicKey(wallet);
-
     // Compute hash of unsigned transaction for integrity verification
     const unsignedTransactionHash = crypto.createHash('sha256')
-      .update(result.transaction.serializeMessage())
+      .update(result.transaction.message.serialize())
       .digest('hex');
 
     // Serialize transaction
-    const serializedTx = result.transaction.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false,
-    });
+    const serializedTx = result.transaction.serialize();
     const unsignedTransaction = Buffer.from(serializedTx).toString('base64');
 
     // Generate unique request ID
@@ -590,10 +581,10 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
     }
 
     // Deserialize the user-signed transaction
-    let transaction: Transaction;
+    let transaction: VersionedTransaction;
     try {
       const txBuffer = Buffer.from(signedTransaction, 'base64');
-      transaction = Transaction.from(txBuffer);
+      transaction = VersionedTransaction.deserialize(txBuffer);
     } catch (error) {
       return res.status(400).json({
         error: 'Invalid transaction format'
@@ -625,14 +616,15 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
     const buyerPubKey = new PublicKey(purchaseData.buyerWallet);
 
     // SECURITY: Validate blockhash
-    if (!transaction.recentBlockhash) {
+    const recentBlockhash = transaction.message.recentBlockhash;
+    if (!recentBlockhash) {
       return res.status(400).json({
         error: 'Invalid transaction: missing blockhash'
       });
     }
 
     const isBlockhashValid = await connection.isBlockhashValid(
-      transaction.recentBlockhash,
+      recentBlockhash,
       { commitment: 'confirmed' }
     );
 
@@ -643,29 +635,33 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
     }
 
     // SECURITY: Verify fee payer is the buyer
-    if (!transaction.feePayer || !transaction.feePayer.equals(buyerPubKey)) {
+    const feePayer = transaction.message.staticAccountKeys[0];
+    if (!feePayer || !feePayer.equals(buyerPubKey)) {
       return res.status(400).json({
         error: 'Invalid transaction: fee payer must be buyer wallet'
       });
     }
 
     // SECURITY: Verify the user signed the transaction
-    const userSignature = transaction.signatures.find(sig =>
-      sig.publicKey.equals(buyerPubKey)
-    );
+    if (!transaction.signatures || transaction.signatures.length === 0) {
+      return res.status(400).json({
+        error: 'Transaction not signed by user wallet'
+      });
+    }
 
-    if (!userSignature || !userSignature.signature) {
+    const userSignature = transaction.signatures[0];
+    if (!userSignature) {
       return res.status(400).json({
         error: 'Transaction not signed by user wallet'
       });
     }
 
     // Verify user signature is valid
-    const messageData = transaction.serializeMessage();
+    const messageData = transaction.message.serialize();
     const userSigValid = nacl.sign.detached.verify(
       messageData,
-      userSignature.signature,
-      userSignature.publicKey.toBytes()
+      userSignature,
+      buyerPubKey.toBytes()
     );
 
     if (!userSigValid) {
@@ -676,7 +672,7 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
 
     // SECURITY: Verify transaction hasn't been tampered with
     const receivedTransactionHash = crypto.createHash('sha256')
-      .update(transaction.serializeMessage())
+      .update(transaction.message.serialize())
       .digest('hex');
 
     if (receivedTransactionHash !== purchaseData.unsignedTransactionHash) {
@@ -725,7 +721,7 @@ router.post('/:tokenAddress/purchase/confirm', async (req: Request, res: Respons
 
     const { decryptEscrowKeypair } = await import('../lib/presale-escrow');
     const escrowKeypair = decryptEscrowKeypair(icoSale.escrow_priv_key);
-    transaction.partialSign(escrowKeypair);
+    transaction.sign([escrowKeypair]);
 
     // Get blockhash for confirmation
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
@@ -915,22 +911,13 @@ router.post('/:tokenAddress/claim/prepare', async (req: Request, res: Response) 
       walletAddress: wallet,
     });
 
-    // SECURITY: Set recent blockhash to prevent replay attacks
-    const connection = new Connection(RPC_URL, 'confirmed');
-    const { blockhash } = await connection.getLatestBlockhash('confirmed');
-    result.transaction.recentBlockhash = blockhash;
-    result.transaction.feePayer = new PublicKey(wallet);
-
     // Compute hash of unsigned transaction for integrity verification
     const unsignedTransactionHash = crypto.createHash('sha256')
-      .update(result.transaction.serializeMessage())
+      .update(result.transaction.message.serialize())
       .digest('hex');
 
     // Serialize unsigned transaction for frontend
-    const serializedTx = result.transaction.serialize({
-      requireAllSignatures: false,
-      verifySignatures: false,
-    });
+    const serializedTx = result.transaction.serialize();
     const unsignedTransaction = Buffer.from(serializedTx).toString('base64');
 
     // Generate unique request ID
@@ -1025,10 +1012,10 @@ router.post('/:tokenAddress/claim/confirm', async (req: Request, res: Response) 
     }
 
     // Deserialize the user-signed transaction
-    let transaction: Transaction;
+    let transaction: VersionedTransaction;
     try {
       const txBuffer = Buffer.from(signedTransaction, 'base64');
-      transaction = Transaction.from(txBuffer);
+      transaction = VersionedTransaction.deserialize(txBuffer);
     } catch (error) {
       return res.status(400).json({
         error: 'Invalid transaction format'
@@ -1060,14 +1047,15 @@ router.post('/:tokenAddress/claim/confirm', async (req: Request, res: Response) 
     const walletPubKey = new PublicKey(claimData.walletAddress);
 
     // SECURITY: Validate blockhash
-    if (!transaction.recentBlockhash) {
+    const recentBlockhash = transaction.message.recentBlockhash;
+    if (!recentBlockhash) {
       return res.status(400).json({
         error: 'Invalid transaction: missing blockhash'
       });
     }
 
     const isBlockhashValid = await connection.isBlockhashValid(
-      transaction.recentBlockhash,
+      recentBlockhash,
       { commitment: 'confirmed' }
     );
 
@@ -1078,29 +1066,33 @@ router.post('/:tokenAddress/claim/confirm', async (req: Request, res: Response) 
     }
 
     // SECURITY: Verify fee payer is the user
-    if (!transaction.feePayer || !transaction.feePayer.equals(walletPubKey)) {
+    const feePayer = transaction.message.staticAccountKeys[0];
+    if (!feePayer || !feePayer.equals(walletPubKey)) {
       return res.status(400).json({
         error: 'Invalid transaction: fee payer must be user wallet'
       });
     }
 
     // SECURITY: Verify the user signed the transaction
-    const userSignature = transaction.signatures.find(sig =>
-      sig.publicKey.equals(walletPubKey)
-    );
+    if (!transaction.signatures || transaction.signatures.length === 0) {
+      return res.status(400).json({
+        error: 'Transaction not signed by user wallet'
+      });
+    }
 
-    if (!userSignature || !userSignature.signature) {
+    const userSignature = transaction.signatures[0];
+    if (!userSignature) {
       return res.status(400).json({
         error: 'Transaction not signed by user wallet'
       });
     }
 
     // Verify user signature is valid
-    const messageData = transaction.serializeMessage();
+    const messageData = transaction.message.serialize();
     const userSigValid = nacl.sign.detached.verify(
       messageData,
-      userSignature.signature,
-      userSignature.publicKey.toBytes()
+      userSignature,
+      walletPubKey.toBytes()
     );
 
     if (!userSigValid) {
@@ -1111,7 +1103,7 @@ router.post('/:tokenAddress/claim/confirm', async (req: Request, res: Response) 
 
     // SECURITY: Verify transaction hasn't been tampered with
     const receivedTransactionHash = crypto.createHash('sha256')
-      .update(transaction.serializeMessage())
+      .update(transaction.message.serialize())
       .digest('hex');
 
     if (receivedTransactionHash !== claimData.unsignedTransactionHash) {
@@ -1154,7 +1146,7 @@ router.post('/:tokenAddress/claim/confirm', async (req: Request, res: Response) 
 
     const { decryptEscrowKeypair } = await import('../lib/presale-escrow');
     const escrowKeypair = decryptEscrowKeypair(icoSale.escrow_priv_key);
-    transaction.partialSign(escrowKeypair);
+    transaction.sign([escrowKeypair]);
 
     // Get blockhash for confirmation
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');

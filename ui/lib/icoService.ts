@@ -22,6 +22,8 @@ import {
   SystemProgram,
   Transaction,
   TransactionInstruction,
+  TransactionMessage,
+  VersionedTransaction,
   Keypair,
 } from '@solana/web3.js';
 import {
@@ -211,7 +213,7 @@ export async function preparePurchaseTransaction(params: {
   buyerWallet: string;
   solAmountLamports: bigint;
 }): Promise<{
-  transaction: Transaction;
+  transaction: VersionedTransaction;
   icoSaleId: number;
   tokensBought: bigint;
   tokensToVault: bigint;
@@ -294,7 +296,6 @@ export async function preparePurchaseTransaction(params: {
     );
   }
 
-  const transaction = new Transaction();
   const instructions: TransactionInstruction[] = [];
 
   // 1. Transfer SOL from buyer to escrow (use actualSolAmount, not requested amount)
@@ -318,12 +319,25 @@ export async function preparePurchaseTransaction(params: {
     )
   );
 
-  transaction.add(...instructions);
-
   // Get recent blockhash
   const { blockhash } = await connection.getLatestBlockhash();
-  transaction.recentBlockhash = blockhash;
-  transaction.feePayer = buyerPubKey;
+
+  // Create versioned transaction using TransactionMessage
+  const messageV0 = new TransactionMessage({
+    payerKey: buyerPubKey,
+    recentBlockhash: blockhash,
+    instructions,
+  }).compileToV0Message();
+
+  const transaction = new VersionedTransaction(messageV0);
+
+  // Debug logging
+  console.log('[preparePurchaseTransaction] Transaction created:');
+  console.log('  - Required signatures:', transaction.message.header.numRequiredSignatures);
+  console.log('  - Static account keys:', transaction.message.staticAccountKeys.map(k => k.toBase58()));
+  console.log('  - Buyer (should be first):', buyerPubKey.toBase58());
+  console.log('  - Escrow (should be second):', escrowPubKey.toBase58());
+  console.log('  - Initial signatures length:', transaction.signatures.length);
 
   // NOTE: We do NOT sign with escrow here
   // The signing flow is:
@@ -387,7 +401,7 @@ export async function prepareClaimTransaction(params: {
   tokenAddress: string;
   walletAddress: string;
 }): Promise<{
-  transaction: Transaction;
+  transaction: VersionedTransaction;
   icoSaleId: number;
   tokensToClaim: bigint;
   escrowPubKey: string;
@@ -426,7 +440,6 @@ export async function prepareClaimTransaction(params: {
   const escrowTokenAccount = await getAssociatedTokenAddress(tokenMint, escrowPubKey);
   const userTokenAccount = await getAssociatedTokenAddress(tokenMint, walletPubKey);
 
-  const transaction = new Transaction();
   const instructions: TransactionInstruction[] = [];
 
   // Check if user's token account exists
@@ -453,11 +466,24 @@ export async function prepareClaimTransaction(params: {
     )
   );
 
-  transaction.add(...instructions);
-
   const { blockhash } = await connection.getLatestBlockhash();
-  transaction.recentBlockhash = blockhash;
-  transaction.feePayer = walletPubKey;
+
+  // Create versioned transaction using TransactionMessage
+  const messageV0 = new TransactionMessage({
+    payerKey: walletPubKey,
+    recentBlockhash: blockhash,
+    instructions,
+  }).compileToV0Message();
+
+  const transaction = new VersionedTransaction(messageV0);
+
+  // Debug logging
+  console.log('[prepareClaimTransaction] Transaction created:');
+  console.log('  - Required signatures:', transaction.message.header.numRequiredSignatures);
+  console.log('  - Static account keys:', transaction.message.staticAccountKeys.map(k => k.toBase58()));
+  console.log('  - Wallet (should be first):', walletPubKey.toBase58());
+  console.log('  - Escrow (should be second):', escrowPubKey.toBase58());
+  console.log('  - Initial signatures length:', transaction.signatures.length);
 
   return {
     transaction,
@@ -472,8 +498,8 @@ export async function prepareClaimTransaction(params: {
  */
 export async function signClaimTransaction(params: {
   tokenAddress: string;
-  transaction: Transaction;
-}): Promise<Transaction> {
+  transaction: VersionedTransaction;
+}): Promise<VersionedTransaction> {
   // Get ICO sale
   const icoSale = await getIcoSaleByTokenAddress(params.tokenAddress);
   if (!icoSale || !icoSale.escrow_priv_key) {
@@ -484,7 +510,7 @@ export async function signClaimTransaction(params: {
   const escrowKeypair = decryptEscrowKeypair(icoSale.escrow_priv_key);
 
   // Sign transaction with escrow key
-  params.transaction.partialSign(escrowKeypair);
+  params.transaction.sign([escrowKeypair]);
 
   return params.transaction;
 }
