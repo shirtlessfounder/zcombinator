@@ -270,6 +270,7 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
     const connection = new Connection(RPC_URL, 'confirmed');
     const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
     const managerWallet = new PublicKey(MANAGER_WALLET);
+    const isSameWallet = lpOwner.publicKey.equals(managerWallet);
 
     // Create CpAmm instance and get pool state
     const cpAmm = new CpAmm(connection);
@@ -412,65 +413,67 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
 
     combinedTx.add(...removeLiquidityTx.instructions);
 
-    // Create destination ATAs
-    if (!withdrawQuote.outAmountA.isZero()) {
-      combinedTx.add(
-        createAssociatedTokenAccountIdempotentInstruction(
-          managerWallet,
-          destTokenAAta,
-          managerWallet,
-          poolState.tokenAMint,
-          tokenAProgram
-        )
-      );
-    }
-
-    if (!withdrawQuote.outAmountB.isZero() && !isTokenBNativeSOL) {
-      combinedTx.add(
-        createAssociatedTokenAccountIdempotentInstruction(
-          managerWallet,
-          destTokenBAta,
-          managerWallet,
-          poolState.tokenBMint,
-          tokenBProgram
-        )
-      );
-    }
-
-    // Add transfer instructions
-    if (!withdrawQuote.outAmountA.isZero()) {
-      combinedTx.add(
-        createTransferInstruction(
-          tokenAAta,
-          destTokenAAta,
-          lpOwner.publicKey,
-          BigInt(withdrawQuote.outAmountA.toString()),
-          [],
-          tokenAProgram
-        )
-      );
-    }
-
-    if (!withdrawQuote.outAmountB.isZero()) {
-      if (isTokenBNativeSOL) {
+    // Create destination ATAs and transfer instructions (skip if LP owner is manager)
+    if (!isSameWallet) {
+      if (!withdrawQuote.outAmountA.isZero()) {
         combinedTx.add(
-          SystemProgram.transfer({
-            fromPubkey: lpOwner.publicKey,
-            toPubkey: managerWallet,
-            lamports: Number(withdrawQuote.outAmountB.toString())
-          })
+          createAssociatedTokenAccountIdempotentInstruction(
+            managerWallet,
+            destTokenAAta,
+            managerWallet,
+            poolState.tokenAMint,
+            tokenAProgram
+          )
         );
-      } else {
+      }
+
+      if (!withdrawQuote.outAmountB.isZero() && !isTokenBNativeSOL) {
         combinedTx.add(
-          createTransferInstruction(
-            tokenBAta,
+          createAssociatedTokenAccountIdempotentInstruction(
+            managerWallet,
             destTokenBAta,
-            lpOwner.publicKey,
-            BigInt(withdrawQuote.outAmountB.toString()),
-            [],
+            managerWallet,
+            poolState.tokenBMint,
             tokenBProgram
           )
         );
+      }
+
+      // Add transfer instructions
+      if (!withdrawQuote.outAmountA.isZero()) {
+        combinedTx.add(
+          createTransferInstruction(
+            tokenAAta,
+            destTokenAAta,
+            lpOwner.publicKey,
+            BigInt(withdrawQuote.outAmountA.toString()),
+            [],
+            tokenAProgram
+          )
+        );
+      }
+
+      if (!withdrawQuote.outAmountB.isZero()) {
+        if (isTokenBNativeSOL) {
+          combinedTx.add(
+            SystemProgram.transfer({
+              fromPubkey: lpOwner.publicKey,
+              toPubkey: managerWallet,
+              lamports: Number(withdrawQuote.outAmountB.toString())
+            })
+          );
+        } else {
+          combinedTx.add(
+            createTransferInstruction(
+              tokenBAta,
+              destTokenBAta,
+              lpOwner.publicKey,
+              BigInt(withdrawQuote.outAmountB.toString()),
+              [],
+              tokenBProgram
+            )
+          );
+        }
       }
     }
 
@@ -822,6 +825,7 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
     const connection = new Connection(RPC_URL, 'confirmed');
     const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
     const managerWallet = new PublicKey(MANAGER_WALLET);
+    const isSameWallet = lpOwner.publicKey.equals(managerWallet);
 
     // Create CpAmm instance and get pool state
     const cpAmm = new CpAmm(connection);
@@ -932,40 +936,42 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       );
     }
 
-    // Add transfer instructions from manager to LP owner
-    if (!tokenAAmountRaw.isZero()) {
-      combinedTx.add(
-        createTransferInstruction(
-          managerTokenAAta,
-          lpOwnerTokenAAta,
-          managerWallet,
-          BigInt(tokenAAmountRaw.toString()),
-          [],
-          tokenAProgram
-        )
-      );
-    }
-
-    if (!tokenBAmountRaw.isZero()) {
-      if (isTokenBNativeSOL) {
-        combinedTx.add(
-          SystemProgram.transfer({
-            fromPubkey: managerWallet,
-            toPubkey: lpOwner.publicKey,
-            lamports: Number(tokenBAmountRaw.toString())
-          })
-        );
-      } else {
+    // Add transfer instructions from manager to LP owner (skip if same wallet)
+    if (!isSameWallet) {
+      if (!tokenAAmountRaw.isZero()) {
         combinedTx.add(
           createTransferInstruction(
-            managerTokenBAta,
-            lpOwnerTokenBAta,
+            managerTokenAAta,
+            lpOwnerTokenAAta,
             managerWallet,
-            BigInt(tokenBAmountRaw.toString()),
+            BigInt(tokenAAmountRaw.toString()),
             [],
-            tokenBProgram
+            tokenAProgram
           )
         );
+      }
+
+      if (!tokenBAmountRaw.isZero()) {
+        if (isTokenBNativeSOL) {
+          combinedTx.add(
+            SystemProgram.transfer({
+              fromPubkey: managerWallet,
+              toPubkey: lpOwner.publicKey,
+              lamports: Number(tokenBAmountRaw.toString())
+            })
+          );
+        } else {
+          combinedTx.add(
+            createTransferInstruction(
+              managerTokenBAta,
+              lpOwnerTokenBAta,
+              managerWallet,
+              BigInt(tokenBAmountRaw.toString()),
+              [],
+              tokenBProgram
+            )
+          );
+        }
       }
     }
 
