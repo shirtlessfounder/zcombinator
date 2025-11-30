@@ -40,7 +40,10 @@ export async function POST(
       );
     }
 
-    const data = await response.json();
+    const responseData = await response.json();
+    // Birdeye v3 API returns { success: true, data: { ... } }
+    const data = responseData.data || responseData;
+
     // Normalize Birdeye API response to match mock format
     return NextResponse.json({
       success: true,
