@@ -452,10 +452,10 @@ export function StakeContent() {
         {/* Info Text */}
         <div className="flex flex-col gap-[8px] items-start w-full">
           <p className="font-normal text-[14px] leading-[1.2]" style={{ fontFamily: 'Inter, sans-serif', color: mutedTextColor }}>
-            Once you stake, funds are locked. The next unlock will be Nov 7th.
+            Staking is deprecated until decision markets decide otherwise.
           </p>
           <p className="font-normal text-[14px] leading-[1.2]" style={{ fontFamily: 'Inter, sans-serif', color: mutedTextColor }}>
-            Staking earlier in each period leads to higher rewards.
+            Deposits and withdrawals are completely available.
           </p>
         </div>
 
@@ -474,7 +474,7 @@ export function StakeContent() {
             </p>
             <div className="flex flex-col gap-[12px] items-start mt-[20px]">
               <p className="font-semibold text-[16px] leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#5A5798' : '#403d6d' }}>
-                {wallet ? `${calculateAPY().toFixed(0)}% APY Yield` : '368% APY Yield'}
+                {wallet ? `${calculateAPY().toFixed(0)}% APY Yield` : '0% APY Yield'}
               </p>
               <p className="font-semibold text-[16px] leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
                 {wallet ? `${formatCompactNumber(vaultBalance)} TVL` : '498.2M TVL'}
