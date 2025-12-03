@@ -28,13 +28,6 @@ export interface MintClaimResponseBody {
   transaction: string;
   transactionKey: string;
   claimAmount: string;
-  splitRecipients: Array<{
-    wallet: string;
-    amount: string;
-    label?: string;
-  }>;
-  adminAmount: string;
-  mintDecimals: number;
   message: string;
 }
 
@@ -43,11 +36,6 @@ export interface ConfirmClaimResponseBody {
   transactionSignature: string;
   tokenAddress: string;
   claimAmount: string;
-  splitRecipients: Array<{
-    wallet: string;
-    amount: string;
-    label?: string;
-  }>;
   confirmation: any;
 }
 

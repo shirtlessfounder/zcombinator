@@ -20,7 +20,6 @@ import {
   isMintClaimResponse,
   isConfirmClaimResponse
 } from '@/types/api';
-import { TextInput } from '@/components/TextInput';
 
 interface TokenLaunch {
   id: number;
@@ -72,21 +71,38 @@ interface CreatedToken {
   name: string;
   symbol: string;
   tokenAddress: string;
-  claimLabel: string;
-  socialsLabel: string;
   image?: string;
-  socials: {
-    website?: string;
-    twitter?: string;
-    devTwitter?: string;
-    discord?: string;
-    github?: string;
-    devGithub?: string;
-  };
+  verified: boolean;
+}
+
+// Extended interface for token launches from the API
+interface TokenLaunchFromApi {
+  id: number;
+  launch_time: string;
+  creator_wallet: string;
+  token_address: string;
+  token_metadata_url: string;
+  token_name?: string;
+  token_symbol?: string;
+  verified?: boolean;
+  is_creator_designated?: boolean;
+  creator_twitter?: string;
+  creator_github?: string;
+}
+
+// Claim info returned from the API
+interface ClaimInfo {
+  totalMinted: string;
+  totalClaimed: string;
+  availableToClaim: string;
+  canClaimNow: boolean;
+  maxClaimableNow: string;
+  nextInflationTime: string;
+  timeUntilNextClaim?: string;
 }
 
 export default function PortfolioPage() {
-  const { wallet, externalWallet, activeWallet } = useWallet();
+  const { wallet, externalWallet, activeWallet, hasTwitter, hasGithub, twitterUsername, githubUsername, isPrivyAuthenticated } = useWallet();
   const { signTransaction } = useSignTransaction();
   const { theme } = useTheme();
   const cardBg = theme === 'dark' ? '#222222' : '#ffffff';
@@ -108,15 +124,10 @@ export default function PortfolioPage() {
   const [claiming, setClaiming] = useState<Record<string, boolean>>({});
 
   const [createdTokens, setCreatedTokens] = useState<CreatedToken[]>([]);
-  const [editingSocialsTokenId, setEditingSocialsTokenId] = useState<string | null>(null);
-  const [socialsForm, setSocialsForm] = useState({
-    website: '',
-    twitter: '',
-    devTwitter: '',
-    discord: '',
-    github: '',
-    devGithub: ''
-  });
+  const [createdTokensLoading, setCreatedTokensLoading] = useState(false);
+  const [createdTokenClaimInfo, setCreatedTokenClaimInfo] = useState<Record<string, ClaimInfo>>({});
+  const [createdTokenClaimLoading, setCreatedTokenClaimLoading] = useState<Record<string, boolean>>({});
+  const [createdTokenFilter, setCreatedTokenFilter] = useState<'all' | 'verified' | 'unverified'>('all');
 
   // Fetch all ZC tokens
   useEffect(() => {
@@ -155,6 +166,111 @@ export default function PortfolioPage() {
 
     fetchTokens();
   }, []);
+
+  // Fetch created tokens (tokens launched by this wallet or designated to this user via socials)
+  useEffect(() => {
+    if (!wallet || !isPrivyAuthenticated) {
+      setCreatedTokens([]);
+      return;
+    }
+
+    const fetchCreatedTokens = async () => {
+      setCreatedTokensLoading(true);
+      try {
+        const response = await fetch('/api/launches', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            creator: wallet.toString(),
+            includeSocials: true,
+            twitterUrl: twitterUsername || undefined,
+            githubUrl: githubUsername ? `https://github.com/${githubUsername}` : undefined
+          })
+        });
+
+        if (response.ok) {
+          const data = await response.json();
+          const launches: TokenLaunchFromApi[] = data.launches || [];
+
+          // Convert to CreatedToken format and fetch claim info for each
+          const createdTokensData: CreatedToken[] = [];
+
+          for (const launch of launches) {
+            // Fetch metadata if available
+            let metadata: TokenMetadata | null = null;
+            if (launch.token_metadata_url) {
+              try {
+                const metadataRes = await fetch(launch.token_metadata_url);
+                metadata = await metadataRes.json();
+              } catch (err) {
+                console.error(`Error fetching metadata for ${launch.token_address}:`, err);
+              }
+            }
+
+            // Fetch claim info for this token
+            try {
+              setCreatedTokenClaimLoading(prev => ({ ...prev, [launch.token_address]: true }));
+              const claimResponse = await fetch(`/api/claims/${launch.token_address}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  tokenAddress: launch.token_address,
+                  wallet: wallet.toString()
+                })
+              });
+
+              if (claimResponse.ok) {
+                const claimData = await claimResponse.json();
+                setCreatedTokenClaimInfo(prev => ({
+                  ...prev,
+                  [launch.token_address]: claimData
+                }));
+              }
+            } catch (err) {
+              console.error(`Error fetching claim info for ${launch.token_address}:`, err);
+            } finally {
+              setCreatedTokenClaimLoading(prev => ({ ...prev, [launch.token_address]: false }));
+            }
+
+            const name = metadata?.name || launch.token_name || 'Unknown Token';
+            const symbol = metadata?.symbol || launch.token_symbol || 'UNKNOWN';
+
+            createdTokensData.push({
+              id: launch.token_address,
+              name,
+              symbol,
+              tokenAddress: launch.token_address,
+              image: metadata?.image,
+              verified: launch.verified || false
+            });
+
+            // Also store metadata for use in rendering
+            if (metadata) {
+              setTokenMetadata(prev => ({
+                ...prev,
+                [launch.token_address]: metadata!
+              }));
+            }
+          }
+
+          setCreatedTokens(createdTokensData);
+        }
+      } catch (error) {
+        console.error('Error fetching created tokens:', error);
+      } finally {
+        setCreatedTokensLoading(false);
+      }
+    };
+
+    fetchCreatedTokens();
+  }, [wallet, isPrivyAuthenticated, twitterUsername, githubUsername]);
+
+  // Filter created tokens based on verification status
+  const filteredCreatedTokens = useMemo(() => {
+    if (createdTokenFilter === 'all') return createdTokens;
+    if (createdTokenFilter === 'verified') return createdTokens.filter(t => t.verified);
+    return createdTokens.filter(t => !t.verified);
+  }, [createdTokens, createdTokenFilter]);
 
   // Fetch balances for all tokens when wallet is connected
   useEffect(() => {
@@ -403,53 +519,6 @@ export default function PortfolioPage() {
     }
   };
 
-  const handleOpenSocialsModal = (token: CreatedToken) => {
-    setEditingSocialsTokenId(token.id);
-    setSocialsForm({
-      website: token.socials.website || '',
-      twitter: token.socials.twitter || '',
-      devTwitter: token.socials.devTwitter || '',
-      discord: token.socials.discord || '',
-      github: token.socials.github || '',
-      devGithub: token.socials.devGithub || ''
-    });
-  };
-
-  const handleCloseSocialsModal = () => {
-    setEditingSocialsTokenId(null);
-  };
-
-  const handleSocialsInputChange = (field: keyof typeof socialsForm, value: string) => {
-    setSocialsForm(prev => ({
-      ...prev,
-      [field]: value
-    }));
-  };
-
-  const handleConfirmSocialsEdit = () => {
-    if (!editingSocialsTokenId) return;
-
-    setCreatedTokens(prev =>
-      prev.map(token =>
-        token.id === editingSocialsTokenId
-          ? {
-              ...token,
-              socials: {
-                ...token.socials,
-                ...socialsForm
-              }
-            }
-          : token
-      )
-    );
-
-    setEditingSocialsTokenId(null);
-  };
-
-  const editingSocialsToken = editingSocialsTokenId
-    ? createdTokens.find(token => token.id === editingSocialsTokenId) ?? null
-    : null;
-
   return (
     <div className="flex-1" style={{ padding: '20px 40px', marginLeft: '-20px', marginRight: '-20px' }}>
       <div className="flex flex-col gap-[20px] w-full">
@@ -504,154 +573,6 @@ export default function PortfolioPage() {
           Created tokens
         </button>
       </div>
-
-      {editingSocialsToken && (
-        <div className="fixed inset-0 z-[999] flex items-center justify-center bg-[rgba(10,10,10,0.4)] px-5">
-          <div 
-            className="rounded-[16px] w-full max-w-[520px] px-[28px] py-[32px] flex flex-col gap-[24px]"
-            style={{
-              backgroundColor: theme === 'dark' ? '#292929' : '#ffffff',
-              border: theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5',
-              boxShadow: theme === 'dark' 
-                ? '0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.08)'
-                : '0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04)',
-            }}
-          >
-            <div className="flex items-start justify-between">
-              <div className="flex flex-col gap-[4px]">
-                <h2 className="text-[20px] font-semibold leading-[1.34] tracking-[-0.2px]" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  Edit socials
-                </h2>
-                <p className="text-[14px] leading-[1.6]" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#B8B8B8' : '#717182' }}>
-                  Update public links for {editingSocialsToken?.name ?? 'your project'}.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={handleCloseSocialsModal}
-                className="w-[32px] h-[32px] flex items-center justify-center rounded-full transition-colors"
-                style={{
-                  backgroundColor: 'transparent',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = theme === 'dark' ? '#2a2a2a' : '#f6f6f7';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = 'transparent';
-                }}
-                aria-label="Close socials editor"
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                  <path d="M18 6L6 18" stroke={theme === 'dark' ? '#ffffff' : '#717182'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                  <path d="M6 6L18 18" stroke={theme === 'dark' ? '#ffffff' : '#717182'} strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-              </button>
-            </div>
-
-            <div className="flex flex-col gap-[16px]">
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  Website
-                </label>
-                <TextInput
-                  placeholder="https://yourproject.io"
-                  value={socialsForm.website}
-                  onChange={event => handleSocialsInputChange('website', event.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  X (Twitter)
-                </label>
-                <TextInput
-                  placeholder="https://x.com/username"
-                  value={socialsForm.twitter}
-                  onChange={event => handleSocialsInputChange('twitter', event.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  Dev X profile
-                </label>
-                <TextInput
-                  placeholder="https://x.com/dev"
-                  value={socialsForm.devTwitter}
-                  onChange={event => handleSocialsInputChange('devTwitter', event.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  Discord
-                </label>
-                <TextInput
-                  placeholder="https://discord.gg/your-server"
-                  value={socialsForm.discord}
-                  onChange={event => handleSocialsInputChange('discord', event.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  GitHub
-                </label>
-                <TextInput
-                  placeholder="https://github.com/your-project"
-                  value={socialsForm.github}
-                  onChange={event => handleSocialsInputChange('github', event.target.value)}
-                />
-              </div>
-
-              <div className="flex flex-col gap-[8px]">
-                <label className="text-[14px] font-semibold leading-[16px] tracking-[0.32px] capitalize" style={{ fontFamily: 'Inter, sans-serif', color: theme === 'dark' ? '#ffffff' : '#0a0a0a' }}>
-                  Dev GitHub profile
-                </label>
-                <TextInput
-                  placeholder="https://github.com/your-handle"
-                  value={socialsForm.devGithub}
-                  onChange={event => handleSocialsInputChange('devGithub', event.target.value)}
-                />
-              </div>
-            </div>
-
-            <div className="flex items-center justify-end gap-[12px]">
-              <button
-                type="button"
-                onClick={handleCloseSocialsModal}
-                className="rounded-[6px] px-[12px] py-[10px] text-[12px] font-semibold leading-[12px] tracking-[0.24px] capitalize transition-colors"
-                style={{
-                  fontFamily: 'Inter, sans-serif',
-                  backgroundColor: theme === 'dark' ? '#2a2a2a' : '#ffffff',
-                  border: theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5',
-                  color: theme === 'dark' ? '#ffffff' : '#0a0a0a',
-                }}
-                onMouseEnter={(e) => {
-                  e.currentTarget.style.backgroundColor = theme === 'dark' ? '#303030' : '#f6f6f7';
-                }}
-                onMouseLeave={(e) => {
-                  e.currentTarget.style.backgroundColor = theme === 'dark' ? '#2a2a2a' : '#ffffff';
-                }}
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmSocialsEdit}
-                className="rounded-[6px] px-[16px] py-[12px] text-[12px] font-semibold leading-[12px] tracking-[0.24px] capitalize transition-opacity hover:opacity-90"
-                style={{
-                  fontFamily: 'Inter, sans-serif',
-                  backgroundColor: theme === 'dark' ? '#5A5798' : '#403d6d',
-                  color: '#ffffff',
-                }}
-              >
-                Confirm edit
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Token List */}
       <div className="flex flex-col gap-[12px] w-full">
@@ -851,7 +772,55 @@ export default function PortfolioPage() {
 
         {activeTab === 'created' && (
           <>
-            {createdTokens.length === 0 ? (
+            {/* Filter buttons for verified/unverified */}
+            {createdTokens.length > 0 && !createdTokensLoading && (
+              <div className="flex gap-[8px] mb-[12px]">
+                <button
+                  onClick={() => setCreatedTokenFilter('all')}
+                  className="rounded-[6px] px-[10px] py-[6px] text-[11px] font-semibold leading-[11px] tracking-[0.22px] capitalize transition-colors"
+                  style={{
+                    fontFamily: 'Inter, sans-serif',
+                    backgroundColor: createdTokenFilter === 'all'
+                      ? (theme === 'dark' ? '#5A5798' : '#403d6d')
+                      : (theme === 'dark' ? '#222222' : '#ffffff'),
+                    border: createdTokenFilter === 'all' ? 'none' : (theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5'),
+                    color: createdTokenFilter === 'all' ? '#ffffff' : (theme === 'dark' ? '#ffffff' : '#0a0a0a')
+                  }}
+                >
+                  All ({createdTokens.length})
+                </button>
+                <button
+                  onClick={() => setCreatedTokenFilter('verified')}
+                  className="rounded-[6px] px-[10px] py-[6px] text-[11px] font-semibold leading-[11px] tracking-[0.22px] capitalize transition-colors"
+                  style={{
+                    fontFamily: 'Inter, sans-serif',
+                    backgroundColor: createdTokenFilter === 'verified'
+                      ? (theme === 'dark' ? '#5A5798' : '#403d6d')
+                      : (theme === 'dark' ? '#222222' : '#ffffff'),
+                    border: createdTokenFilter === 'verified' ? 'none' : (theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5'),
+                    color: createdTokenFilter === 'verified' ? '#ffffff' : (theme === 'dark' ? '#ffffff' : '#0a0a0a')
+                  }}
+                >
+                  Verified ({createdTokens.filter(t => t.verified).length})
+                </button>
+                <button
+                  onClick={() => setCreatedTokenFilter('unverified')}
+                  className="rounded-[6px] px-[10px] py-[6px] text-[11px] font-semibold leading-[11px] tracking-[0.22px] capitalize transition-colors"
+                  style={{
+                    fontFamily: 'Inter, sans-serif',
+                    backgroundColor: createdTokenFilter === 'unverified'
+                      ? (theme === 'dark' ? '#5A5798' : '#403d6d')
+                      : (theme === 'dark' ? '#222222' : '#ffffff'),
+                    border: createdTokenFilter === 'unverified' ? 'none' : (theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5'),
+                    color: createdTokenFilter === 'unverified' ? '#ffffff' : (theme === 'dark' ? '#ffffff' : '#0a0a0a')
+                  }}
+                >
+                  Unverified ({createdTokens.filter(t => !t.verified).length})
+                </button>
+              </div>
+            )}
+
+            {createdTokensLoading ? (
               <div
                 className="rounded-[12px] px-[12px] py-[20px] flex items-center justify-center min-h-[100px]"
                 style={{
@@ -862,11 +831,45 @@ export default function PortfolioPage() {
                 }}
               >
                 <p className="text-[14px]" style={{ fontFamily: 'Inter, sans-serif', color: secondaryTextColor }}>
-                  No created tokens yet
+                  Loading your created tokens...
+                </p>
+              </div>
+            ) : createdTokens.length === 0 ? (
+              <div
+                className="rounded-[12px] px-[12px] py-[20px] flex items-center justify-center min-h-[100px]"
+                style={{
+                  backgroundColor: cardBg,
+                  border: `1px solid ${cardBorder}`,
+                  boxShadow: cardShadow,
+                  fontFamily: 'Inter, sans-serif',
+                }}
+              >
+                <p className="text-[14px]" style={{ fontFamily: 'Inter, sans-serif', color: secondaryTextColor }}>
+                  {!wallet ? 'Connect your wallet to see created tokens' : 'No created tokens yet'}
+                </p>
+              </div>
+            ) : filteredCreatedTokens.length === 0 ? (
+              <div
+                className="rounded-[12px] px-[12px] py-[20px] flex items-center justify-center min-h-[100px]"
+                style={{
+                  backgroundColor: cardBg,
+                  border: `1px solid ${cardBorder}`,
+                  boxShadow: cardShadow,
+                  fontFamily: 'Inter, sans-serif',
+                }}
+              >
+                <p className="text-[14px]" style={{ fontFamily: 'Inter, sans-serif', color: secondaryTextColor }}>
+                  No {createdTokenFilter === 'verified' ? 'verified' : 'unverified'} tokens
                 </p>
               </div>
             ) : (
-              createdTokens.map((token) => (
+              filteredCreatedTokens.map((token) => {
+                const claimInfo = createdTokenClaimInfo[token.tokenAddress];
+                const isClaimLoading = createdTokenClaimLoading[token.tokenAddress];
+                const availableToClaim = claimInfo ? Number(claimInfo.availableToClaim) : 0;
+                const canClaim = claimInfo?.canClaimNow && availableToClaim > 0;
+
+                return (
                 <div
                   key={token.id}
                   className="rounded-[12px] px-[12px] py-[20px] flex flex-col gap-[10px]"
@@ -892,10 +895,25 @@ export default function PortfolioPage() {
                           <div className="w-[30px] h-[30px] rounded-[8px] bg-[#403d6d]" />
                         )}
                       </div>
-                      <div className="flex flex-col gap-[8px] w-[148px]">
+                      <div className="flex flex-col gap-[8px]">
                         <div className="flex gap-[6px] items-center text-[16px] font-medium leading-[1.4]" style={{ fontFamily: 'Inter, sans-serif' }}>
                           <p className="whitespace-nowrap" style={{ color: primaryTextColor }}>{token.name}</p>
                           <p className="uppercase whitespace-nowrap" style={{ color: secondaryTextColor }}>{token.symbol}</p>
+                          {token.verified && (
+                            <span
+                              className="inline-flex items-center gap-[2px] px-[6px] py-[2px] rounded-[4px] text-[10px] font-semibold"
+                              style={{
+                                backgroundColor: theme === 'dark' ? 'rgba(74, 222, 128, 0.15)' : 'rgba(34, 197, 94, 0.15)',
+                                color: theme === 'dark' ? '#4ade80' : '#16a34a'
+                              }}
+                              title="This token is verified"
+                            >
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M9 12L11 14L15 10M21 12C21 16.9706 16.9706 21 12 21C7.02944 21 3 16.9706 3 12C3 7.02944 7.02944 3 12 3C16.9706 3 21 7.02944 21 12Z" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                              </svg>
+                              Verified
+                            </span>
+                          )}
                         </div>
                         <div className="flex gap-[4px] items-center">
                           <button
@@ -922,41 +940,39 @@ export default function PortfolioPage() {
                       </div>
                     </div>
 
+                    {/* Claim Info Display */}
+                    {claimInfo && (
+                      <div className="flex flex-col gap-[4px]">
+                        <p className="text-[14px] font-medium" style={{ fontFamily: 'Inter, sans-serif', color: primaryTextColor }}>
+                          Available: {formatBalance(availableToClaim)} ${token.symbol}
+                        </p>
+                        <p className="text-[12px]" style={{ fontFamily: 'Inter, sans-serif', color: secondaryTextColor }}>
+                          Total claimed: {formatBalance(Number(claimInfo.totalClaimed))}
+                        </p>
+                      </div>
+                    )}
+
                     <div className="flex items-center gap-[20px]">
                       <button
                         type="button"
-                        className="bg-[#403d6d] rounded-[6px] px-[12px] py-[10px] text-[12px] font-semibold leading-[12px] tracking-[0.24px] capitalize text-white transition-opacity hover:opacity-90"
+                        onClick={() => handleClaim(token.tokenAddress, token.symbol)}
+                        disabled={!canClaim || claiming[token.tokenAddress] || isClaimLoading}
+                        className="bg-[#403d6d] rounded-[6px] px-[12px] py-[10px] text-[12px] font-semibold leading-[12px] tracking-[0.24px] capitalize text-white transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
                         style={{ fontFamily: 'Inter, sans-serif' }}
                       >
-                        {token.claimLabel}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => handleOpenSocialsModal(token)}
-                        className="rounded-[6px] px-[12px] py-[10px] text-[12px] font-semibold leading-[12px] tracking-[0.24px] capitalize transition-colors"
-                        style={{
-                          fontFamily: 'Inter, sans-serif',
-                          backgroundColor: theme === 'dark' ? '#2a2a2a' : '#ffffff',
-                          border: theme === 'dark' ? '1px solid #1C1C1C' : '1px solid #e5e5e5',
-                          color: theme === 'dark' ? '#ffffff' : '#0a0a0a',
-                        }}
-                        onMouseEnter={(e) => {
-                          if (theme === 'dark') {
-                            e.currentTarget.style.backgroundColor = '#303030';
-                          } else {
-                            e.currentTarget.style.backgroundColor = '#f6f6f7';
-                          }
-                        }}
-                        onMouseLeave={(e) => {
-                          e.currentTarget.style.backgroundColor = theme === 'dark' ? '#2a2a2a' : '#ffffff';
-                        }}
-                      >
-                        {token.socialsLabel}
+                        {claiming[token.tokenAddress]
+                          ? 'Claiming...'
+                          : isClaimLoading
+                            ? 'Loading...'
+                            : !canClaim && claimInfo
+                              ? (availableToClaim <= 0 ? 'All claimed' : 'Not available')
+                              : 'Claim'}
                       </button>
                     </div>
                   </div>
                 </div>
-              ))
+              );
+              })
             )}
           </>
         )}

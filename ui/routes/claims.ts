@@ -19,13 +19,11 @@
 import { Router, Request, Response } from 'express';
 import * as crypto from 'crypto';
 import nacl from 'tweetnacl';
-import { Connection, Keypair, Transaction, PublicKey, ComputeBudgetProgram } from '@solana/web3.js';
+import { Connection, Keypair, Transaction, PublicKey } from '@solana/web3.js';
 import {
   createAssociatedTokenAccountIdempotentInstruction,
   createMintToInstruction,
   getMint,
-  TOKEN_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
   getAssociatedTokenAddress
 } from '@solana/spl-token';
 import bs58 from 'bs58';
@@ -314,16 +312,17 @@ router.post('/mint', async (
     // claimersTotal represents the 90% portion for claimers (excluding 10% admin fee)
     const splitRecipients: SplitRecipient[] = [];
 
-    // Special case for ZC token: fixed amounts to ztorio and solpay only (90% of total claim)
+    // Special case for ZC token: 2.5% to ztorio, 1% to solpay, 10% to admin, rest to developer
     const ZC_TOKEN_ADDRESS = 'GVvPZpC6ymCoiHzYJ7CWZ8LhVn9tL2AUpRjSAsLh6jZC';
     const ZTORIO_ADDRESS = 'A6R6fD82TaTSWKTpKKcRhBotYtc5izyauPFw3yHVYwuP'; // ztorio
     const SOLPAY_ADDRESS = 'J7xnWtfi5Fa3JC1creRBHzo7DkRf6etugCBv1s9vEe5N'; // solpay ($SP)
 
     if (tokenAddress === ZC_TOKEN_ADDRESS) {
-      // ZC token: 25k to ztorio, 10k to solpay from the claimersTotal (90% portion)
-      // The remaining 10% goes to admin as normal
-      const ztorioAmount = BigInt(25000); // 25k tokens
-      const solpayAmount = BigInt(10000); // 10k tokens
+      // Split: 2.5% to ztorio, 1% to solpay, 10% to admin (already calculated), 86.5% to developer
+      // Calculate in basis points for precision: 2.5% = 250/10000, 1% = 100/10000
+      const ztorioAmount = (requestedAmount * BigInt(250)) / BigInt(10000); // 2.5% of total
+      const solpayAmount = (requestedAmount * BigInt(100)) / BigInt(10000); // 1% of total
+      const devAmount = requestedAmount - ztorioAmount - solpayAmount - adminAmount; // 86.5% of total
 
       splitRecipients.push(
         {
@@ -337,10 +336,16 @@ router.post('/mint', async (
           amount: solpayAmount,
           amountWithDecimals: solpayAmount * BigInt(10 ** decimals),
           label: 'solpay'
+        },
+        {
+          wallet: trimmedCreatorWallet,
+          amount: devAmount,
+          amountWithDecimals: devAmount * BigInt(10 ** decimals),
+          label: 'Developer'
         }
       );
 
-      console.log(`ZC token emission split: 25k to ztorio ${ZTORIO_ADDRESS}, 10k to solpay ${SOLPAY_ADDRESS}, plus 10% admin fee`);
+      console.log(`ZC token emission split: 2.5% to ztorio ${ZTORIO_ADDRESS}, 1% to solpay ${SOLPAY_ADDRESS}, 86.5% to developer ${trimmedCreatorWallet}, 10% to admin`);
     } else {
       // Default: 100% of claimersTotal goes to the developer/creator
       splitRecipients.push({
@@ -413,6 +418,11 @@ router.post('/mint', async (
     transaction.recentBlockhash = blockhash;
     transaction.feePayer = userPublicKey;
 
+    // Compute SHA-256 hash of the unsigned transaction message for tamper detection
+    const unsignedTransactionHash = crypto.createHash('sha256')
+      .update(transaction.serializeMessage())
+      .digest('hex');
+
     // Clean up old transactions FIRST (older than 5 minutes) to prevent race conditions
     const fiveMinutesAgo = Date.now() - (5 * 60 * 1000);
     for (const [key, data] of claimTransactions.entries()) {
@@ -424,26 +434,15 @@ router.post('/mint', async (
     // Create a unique key for this transaction with random component to prevent collisions
     const transactionKey = `${tokenAddress}_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
 
-    // Store transaction data for later confirmation
+    // Store transaction data for later confirmation (hash-based validation)
     claimTransactions.set(transactionKey, {
       tokenAddress,
       userWallet,
       claimAmount,
       mintDecimals: decimals,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      unsignedTransactionHash
     });
-
-    // Store split recipients and admin info for validation in confirm endpoint
-    const transactionMetadata = {
-      splitRecipients: splitRecipients.map(r => ({
-        wallet: r.wallet,
-        amount: r.amount.toString(),
-        label: r.label
-      })),
-      adminAmount: adminAmount.toString(),
-      adminTokenAccount: adminTokenAccount.toString()
-    };
-    claimTransactions.set(`${transactionKey}_metadata`, transactionMetadata as any);
 
     // Serialize transaction for user to sign
     const serializedTransaction = transaction.serialize({
@@ -455,13 +454,6 @@ router.post('/mint', async (
       transaction: bs58.encode(serializedTransaction),
       transactionKey,
       claimAmount: requestedAmount.toString(),
-      splitRecipients: splitRecipients.map(r => ({
-        wallet: r.wallet,
-        amount: r.amount.toString(),
-        label: r.label
-      })),
-      adminAmount: adminAmount.toString(),
-      mintDecimals: decimals,
       message: 'Sign this transaction and submit to /claims/confirm'
     };
 
@@ -504,14 +496,6 @@ router.post('/confirm', async (
     const claimData = claimTransactions.get(transactionKey);
     if (!claimData) {
       const errorResponse = { error: 'Transaction data not found. Please call /claims/mint first.' };
-      console.log("claim/confirm error response:", errorResponse);
-      return res.status(400).json(errorResponse);
-    }
-
-    // Retrieve the metadata with split amounts
-    const metadata = claimTransactions.get(`${transactionKey}_metadata`) as any;
-    if (!metadata) {
-      const errorResponse = { error: 'Transaction metadata not found. Please call /claims/mint first.' };
       console.log("claim/confirm error response:", errorResponse);
       return res.status(400).json(errorResponse);
     }
@@ -707,290 +691,25 @@ router.post('/confirm', async (
       return res.status(400).json(errorResponse);
     }
 
-    // CRITICAL SECURITY: Derive the creator's Associated Token Account (ATA) address
-    console.log("About to create mintPublicKey from tokenAddress:", { tokenAddress: claimData.tokenAddress });
-    let mintPublicKey;
-    try {
-      mintPublicKey = new PublicKey(claimData.tokenAddress);
-      console.log("Successfully created mintPublicKey:", mintPublicKey.toBase58());
-    } catch (error) {
-      console.error("Error creating PublicKey from tokenAddress:", error);
-      const errorResponse = { error: 'Invalid token address format' };
-      console.log("claim/confirm error response:", errorResponse);
-      return res.status(400).json(errorResponse);
-    }
+    // CRITICAL SECURITY: Verify transaction hasn't been tampered with using hash comparison
+    // This is simpler and more secure than instruction-by-instruction validation
+    const receivedTransactionHash = crypto.createHash('sha256')
+      .update(transaction.serializeMessage())
+      .digest('hex');
 
-    // Mathematically derive the creator's ATA address (no blockchain calls)
-    console.log("About to create PDA with program constants");
-    console.log("TOKEN_PROGRAM_ID:", TOKEN_PROGRAM_ID.toBase58());
-    console.log("ASSOCIATED_TOKEN_PROGRAM_ID:", ASSOCIATED_TOKEN_PROGRAM_ID.toBase58());
-
-    const [authorizedTokenAccountAddress] = PublicKey.findProgramAddressSync(
-      [
-        authorizedPublicKey.toBuffer(),
-        TOKEN_PROGRAM_ID.toBuffer(), // SPL Token program
-        mintPublicKey.toBuffer()
-      ],
-      ASSOCIATED_TOKEN_PROGRAM_ID // Associated Token program
-    );
-    console.log("Successfully created authorizedTokenAccountAddress:", authorizedTokenAccountAddress.toBase58());
-
-    // CRITICAL SECURITY: Derive the admin's ATA address
-    const adminPublicKey = new PublicKey(ADMIN_WALLET);
-    const [adminTokenAccountAddress] = PublicKey.findProgramAddressSync(
-      [
-        adminPublicKey.toBuffer(),
-        TOKEN_PROGRAM_ID.toBuffer(),
-        mintPublicKey.toBuffer()
-      ],
-      ASSOCIATED_TOKEN_PROGRAM_ID
-    );
-    console.log("Successfully created adminTokenAccountAddress:", adminTokenAccountAddress.toBase58());
-
-    // Define safe program IDs that wallets may add for optimization
-    const COMPUTE_BUDGET_PROGRAM_ID = ComputeBudgetProgram.programId;
-    const LIGHTHOUSE_PROGRAM_ID = new PublicKey("L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95");
-
-    // CRITICAL SECURITY: Validate ONLY allowed instruction types are present
-    // This prevents injection of malicious instructions that would receive protocol signature
-    console.log("Validating transaction instruction types...");
-    for (let i = 0; i < transaction.instructions.length; i++) {
-      const instruction = transaction.instructions[i];
-      const programId = instruction.programId;
-
-      // Allow safe programs: TOKEN_PROGRAM, ASSOCIATED_TOKEN_PROGRAM, ComputeBudget, and Lighthouse
-      if (!programId.equals(TOKEN_PROGRAM_ID) &&
-          !programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID) &&
-          !programId.equals(COMPUTE_BUDGET_PROGRAM_ID) &&
-          !programId.equals(LIGHTHOUSE_PROGRAM_ID)) {
-        const errorResponse = {
-          error: 'Invalid transaction: unauthorized program instruction detected',
-          details: `Instruction ${i} uses unauthorized program: ${programId.toBase58()}`
-        };
-        console.log("claim/confirm error response:", errorResponse);
-        return res.status(400).json(errorResponse);
-      }
-
-      // Validate TOKEN_PROGRAM instructions are only MintTo (opcode 7)
-      if (programId.equals(TOKEN_PROGRAM_ID)) {
-        if (instruction.data.length < 1 || instruction.data[0] !== 7) {
-          const errorResponse = {
-            error: 'Invalid transaction: unauthorized token instruction detected',
-            details: `Instruction ${i} has invalid opcode: ${instruction.data[0]}`
-          };
-          console.log("claim/confirm error response:", errorResponse);
-          return res.status(400).json(errorResponse);
-        }
-      }
-
-      // Validate ASSOCIATED_TOKEN_PROGRAM instructions are only CreateIdempotent (opcode 1)
-      if (programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
-        if (instruction.data.length < 1 || instruction.data[0] !== 1) {
-          const errorResponse = {
-            error: 'Invalid transaction: unauthorized ATA instruction detected',
-            details: `Instruction ${i} has invalid ATA opcode: ${instruction.data[0]}`
-          };
-          console.log("claim/confirm error response:", errorResponse);
-          return res.status(400).json(errorResponse);
-        }
-      }
-    }
-    console.log("✓ All instruction types validated - only authorized programs and opcodes");
-
-    // CRITICAL SECURITY: Validate mint instructions match expected split recipients + admin
-    const expectedSplitRecipients = metadata.splitRecipients || [];
-    const expectedRecipientCount = expectedSplitRecipients.length + 1; // splits + admin
-    let mintInstructionCount = 0;
-
-    console.log("Validating transaction with", transaction.instructions.length, "instructions");
-    console.log("Expected recipients:", {
-      splitRecipients: expectedSplitRecipients.length,
-      admin: 1,
-      total: expectedRecipientCount
-    });
-
-    // First pass: count mint instructions
-    for (const instruction of transaction.instructions) {
-      if (instruction.programId.equals(TOKEN_PROGRAM_ID) &&
-          instruction.data.length >= 9 &&
-          instruction.data[0] === 7) {
-        mintInstructionCount++;
-      }
-    }
-
-    // Validate correct number of mint instructions
-    if (mintInstructionCount === 0) {
-      const errorResponse = { error: 'Invalid transaction: no mint instructions found' };
-      console.log("claim/confirm error response:", errorResponse);
-      return res.status(400).json(errorResponse);
-    }
-
-    if (mintInstructionCount !== expectedRecipientCount) {
+    if (receivedTransactionHash !== claimData.unsignedTransactionHash) {
+      console.log(`  ⚠️  Transaction hash mismatch detected`);
+      console.log(`    Expected: ${claimData.unsignedTransactionHash.substring(0, 16)}...`);
+      console.log(`    Received: ${receivedTransactionHash.substring(0, 16)}...`);
       const errorResponse = {
-        error: `Invalid transaction: expected ${expectedRecipientCount} mint instructions (${expectedSplitRecipients.length} recipients + 1 admin), found ${mintInstructionCount}`
+        error: 'Transaction verification failed: transaction has been modified',
+        details: 'Transaction structure does not match the original unsigned transaction'
       };
       console.log("claim/confirm error response:", errorResponse);
       return res.status(400).json(errorResponse);
     }
-
-    // Get the token decimals to convert claim amounts to base units
-    const mintInfo = await getMint(connection, mintPublicKey);
-    const expectedAdminAmountWithDecimals = BigInt(metadata.adminAmount) * BigInt(10 ** mintInfo.decimals);
-
-    // Create expected recipient map with token account addresses and amounts
-    const expectedRecipients = new Map<string, bigint>();
-
-    // Add all split recipients
-    for (const recipient of expectedSplitRecipients) {
-      const recipientPublicKey = new PublicKey(recipient.wallet);
-      const recipientTokenAccount = await getAssociatedTokenAddress(
-        mintPublicKey,
-        recipientPublicKey
-      );
-      const expectedAmount = BigInt(recipient.amount) * BigInt(10 ** mintInfo.decimals);
-      expectedRecipients.set(recipientTokenAccount.toBase58(), expectedAmount);
-    }
-
-    // Add admin recipient
-    expectedRecipients.set(adminTokenAccountAddress.toBase58(), expectedAdminAmountWithDecimals);
-
-    console.log("Expected recipients with amounts:", {
-      splitRecipients: expectedSplitRecipients.map((r: any) => ({
-        wallet: r.wallet,
-        amount: r.amount,
-        amountWithDecimals: (BigInt(r.amount) * BigInt(10 ** mintInfo.decimals)).toString()
-      })),
-      admin: {
-        wallet: ADMIN_WALLET,
-        amount: metadata.adminAmount,
-        amountWithDecimals: expectedAdminAmountWithDecimals.toString()
-      }
-    });
-
-    // Track which recipients have been validated
-    const validatedRecipients = new Set<string>();
-
-    // Second pass: validate ALL mint instructions match expected recipients
-    for (let i = 0; i < transaction.instructions.length; i++) {
-      const instruction = transaction.instructions[i];
-      console.log(`Instruction ${i}:`, {
-        programId: instruction.programId.toString(),
-        dataLength: instruction.data.length,
-        keysLength: instruction.keys.length,
-        firstByte: instruction.data.length > 0 ? instruction.data[0] : undefined
-      });
-
-      // Allow Compute Budget instructions (for priority fees and compute units)
-      if (instruction.programId.equals(COMPUTE_BUDGET_PROGRAM_ID)) {
-        continue;
-      }
-
-      // Allow ATA creation instructions (created by server in /claims/mint)
-      if (instruction.programId.equals(ASSOCIATED_TOKEN_PROGRAM_ID)) {
-        continue;
-      }
-
-      // Allow Lighthouse instructions (for transaction optimization)
-      if (instruction.programId.equals(LIGHTHOUSE_PROGRAM_ID)) {
-        continue;
-      }
-
-      // Check if this is a mintTo instruction (SPL Token program)
-      if (instruction.programId.equals(TOKEN_PROGRAM_ID)) {
-        // Parse mintTo instruction - first byte is instruction type (7 = mintTo)
-        if (instruction.data.length >= 9 && instruction.data[0] === 7) {
-          console.log("Found mintTo instruction!");
-
-          // Validate mint amount (bytes 1-8 are amount as little-endian u64)
-          const mintAmount = instruction.data.readBigUInt64LE(1);
-
-          // Validate complete mint instruction structure
-          if (instruction.keys.length >= 3) {
-            const mintAccount = instruction.keys[0].pubkey; // mint account
-            const recipientAccount = instruction.keys[1].pubkey; // recipient token account
-            const mintAuthority = instruction.keys[2].pubkey; // mint authority
-
-            console.log("Mint instruction validation:", {
-              mintAccount: mintAccount.toBase58(),
-              expectedMint: mintPublicKey.toBase58(),
-              mintMatches: mintAccount.equals(mintPublicKey),
-              recipientAccount: recipientAccount.toBase58(),
-              mintAmount: mintAmount.toString(),
-              mintAuthority: mintAuthority.toBase58(),
-              expectedAuthority: protocolKeypair.publicKey.toBase58(),
-              authorityMatches: mintAuthority.equals(protocolKeypair.publicKey)
-            });
-
-            // CRITICAL SECURITY: Validate mint account is correct
-            if (!mintAccount.equals(mintPublicKey)) {
-              const errorResponse = { error: 'Invalid transaction: mint instruction has wrong token mint' };
-              console.log("claim/confirm error response:", errorResponse);
-              return res.status(400).json(errorResponse);
-            }
-
-            // CRITICAL SECURITY: Validate mint authority is protocol keypair
-            if (!mintAuthority.equals(protocolKeypair.publicKey)) {
-              const errorResponse = { error: 'Invalid transaction: mint authority must be protocol wallet' };
-              console.log("claim/confirm error response:", errorResponse);
-              return res.status(400).json(errorResponse);
-            }
-
-            // CRITICAL SECURITY: Validate recipient and amount match expected
-            const recipientKey = recipientAccount.toBase58();
-            const expectedAmount = expectedRecipients.get(recipientKey);
-
-            if (expectedAmount === undefined) {
-              const errorResponse = { error: 'Invalid transaction: mint instruction has unauthorized recipient' };
-              console.log("claim/confirm error response:", errorResponse);
-              console.log("Unauthorized recipient:", {
-                recipientAccount: recipientKey,
-                expectedRecipients: Array.from(expectedRecipients.keys())
-              });
-              return res.status(400).json(errorResponse);
-            }
-
-            if (mintAmount !== expectedAmount) {
-              const errorResponse = { error: 'Invalid transaction: mint instruction has incorrect amount' };
-              console.log("claim/confirm error response:", errorResponse);
-              console.log("Amount mismatch:", {
-                recipientAccount: recipientKey,
-                actualAmount: mintAmount.toString(),
-                expectedAmount: expectedAmount.toString()
-              });
-              return res.status(400).json(errorResponse);
-            }
-
-            // Mark this recipient as validated
-            validatedRecipients.add(recipientKey);
-            console.log("✓ Valid mint instruction found for recipient:", recipientKey);
-          }
-        } else {
-          // SECURITY: Reject any TOKEN_PROGRAM instruction that is not mintTo (opcode 7)
-          const errorResponse = { error: 'Invalid transaction: contains unauthorized token program instructions' };
-          console.log("claim/confirm error response:", errorResponse);
-          return res.status(400).json(errorResponse);
-        }
-      } else {
-        // SECURITY: Reject any unknown program instruction (defense-in-depth)
-        const errorResponse = { error: 'Invalid transaction: contains unexpected instructions' };
-        console.log("claim/confirm error response:", errorResponse);
-        return res.status(400).json(errorResponse);
-      }
-    }
-
-    // CRITICAL SECURITY: Ensure ALL expected recipients were validated
-    if (validatedRecipients.size !== expectedRecipients.size) {
-      const errorResponse = { error: 'Invalid transaction: missing mint instructions for some recipients' };
-      console.log("claim/confirm error response:", errorResponse);
-      console.log("Validation incomplete:", {
-        validated: validatedRecipients.size,
-        expected: expectedRecipients.size,
-        missing: Array.from(expectedRecipients.keys()).filter(k => !validatedRecipients.has(k))
-      });
-      return res.status(400).json(errorResponse);
-    }
-
-    console.log("✓ All mint instructions validated successfully");
+    console.log(`✓ Transaction integrity verified (cryptographic hash match)`);
+    console.log(`  Hash: ${receivedTransactionHash.substring(0, 16)}...`);
 
     // Add protocol signature (mint authority)
     transaction.partialSign(protocolKeypair);
@@ -1045,19 +764,14 @@ router.post('/confirm', async (
     }
 
 
-    // Get split recipients from metadata before cleanup
-    const splitRecipients = metadata.splitRecipients || [];
-
     // Clean up the transaction data from memory
     claimTransactions.delete(transactionKey);
-    claimTransactions.delete(`${transactionKey}_metadata`);
 
     const successResponse = {
       success: true as const,
       transactionSignature: signature,
       tokenAddress: claimData.tokenAddress,
       claimAmount: claimData.claimAmount,
-      splitRecipients,
       confirmation
     };
 

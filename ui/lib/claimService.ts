@@ -45,6 +45,7 @@ export interface ClaimTransaction {
   claimAmount: string;
   mintDecimals: number;
   timestamp: number;
+  unsignedTransactionHash: string; // SHA-256 hash for tamper detection
 }
 
 export const claimTransactions = new Map<string, ClaimTransaction>();
