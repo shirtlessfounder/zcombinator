@@ -293,10 +293,11 @@ export async function calculateClaimEligibility(
   // Get total minted across ALL wallets using cached implementation
   let { totalMinted } = await getTokenMintHistory(tokenAddress);
 
-  // Special case: For token GVvPZpC6ymCoiHzYJ7CWZ8LhVn9tL2AUpRjSAsLh6jZC, subtract 41M from total claimed, 
-  // Since there was an issue early in the project where people minted 41M tokens mistakenly. hands burned 41M of his own tokens after patching the issue.
+  // Special case: For token GVvPZpC6ymCoiHzYJ7CWZ8LhVn9tL2AUpRjSAsLh6jZC, subtract 163M from total claimed:
+  // - 41M: Issue early in the project where people minted 41M tokens mistakenly. hands burned 41M of his own tokens after patching the issue.
+  // - 122M: Tokens minted to facilitate the merger with percent markets
   if (tokenAddress === 'GVvPZpC6ymCoiHzYJ7CWZ8LhVn9tL2AUpRjSAsLh6jZC') {
-    const adjustment = BigInt(41000000);
+    const adjustment = BigInt(163000000);
     totalMinted = totalMinted > adjustment ? totalMinted - adjustment : BigInt(0);
   }
 
