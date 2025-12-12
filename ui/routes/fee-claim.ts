@@ -332,13 +332,16 @@ router.post('/claim', feeClaimLimiter, async (req: Request, res: Response) => {
       const tokenBTransferAmount = totalTokenBFees.mul(new BN(basisPoints)).div(new BN(100000));
 
       // Get destination token accounts
+      // allowOwnerOffCurve: true allows PDAs as fee recipients
       const destTokenAAta = await getAssociatedTokenAddress(
         poolState.tokenAMint,
-        destinationAddress
+        destinationAddress,
+        true // allowOwnerOffCurve
       );
       const destTokenBAta = isTokenBNativeSOL ? destinationAddress : await getAssociatedTokenAddress(
         poolState.tokenBMint,
-        destinationAddress
+        destinationAddress,
+        true // allowOwnerOffCurve
       );
 
       // Add ATA creation instruction for Token A destination (always SPL token)
