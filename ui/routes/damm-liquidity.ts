@@ -121,6 +121,7 @@ async function acquireLiquidityLock(poolAddress: string): Promise<() => void> {
 const poolToTicker: Record<string, string> = {
   'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad': 'ZC',
   '2FCqTyvFcE4uXgRL1yh56riZ9vdjVgoP6yknZW3f8afX': 'OOGWAY',
+  'Ez1QYeC95xJRwPA9SR7YWC1H1Tj43exJr91QqKf8Puu1': 'SURF',
 };
 
 /**
@@ -238,10 +239,10 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
       });
     }
 
-    // Validate withdrawal percentage (maximum 15%)
-    if (typeof withdrawalPercentage !== 'number' || withdrawalPercentage <= 0 || withdrawalPercentage > 15) {
+    // Validate withdrawal percentage (maximum 50%)
+    if (typeof withdrawalPercentage !== 'number' || withdrawalPercentage <= 0 || withdrawalPercentage > 50) {
       return res.status(400).json({
-        error: 'withdrawalPercentage must be a number between 0 and 15'
+        error: 'withdrawalPercentage must be a number between 0 and 50'
       });
     }
 
