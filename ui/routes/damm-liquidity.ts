@@ -119,11 +119,13 @@ async function acquireLiquidityLock(poolAddress: string): Promise<() => void> {
 
 // Pool address to ticker mapping (shared config)
 const poolToTicker: Record<string, string> = {
-  'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad': 'ZC',
   '2FCqTyvFcE4uXgRL1yh56riZ9vdjVgoP6yknZW3f8afX': 'OOGWAY',
   'Ez1QYeC95xJRwPA9SR7YWC1H1Tj43exJr91QqKf8Puu1': 'SURF',
   'PS3rPSb49GnAkmh3tec1RQizgNSb1hUwPsYHGGuAy5r': 'SURFTEST',
 };
+
+// Whitelisted DAMM pools
+const WHITELISTED_DAMM_POOLS = new Set(Object.keys(poolToTicker));
 
 /**
  * Get the manager wallet address for a specific pool
@@ -229,14 +231,26 @@ router.post('/withdraw/build', dammLiquidityLimiter, async (req: Request, res: R
       });
     }
 
-    // Validate poolAddress is a valid Solana public key (default to main pool if not provided)
-    const DEFAULT_POOL_ADDRESS = 'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad';
+    // Validate poolAddress is a valid Solana public key
+    if (!poolAddressInput) {
+      return res.status(400).json({
+        error: 'Missing required field: poolAddress'
+      });
+    }
+
     let poolAddress: PublicKey;
     try {
-      poolAddress = new PublicKey(poolAddressInput || DEFAULT_POOL_ADDRESS);
+      poolAddress = new PublicKey(poolAddressInput);
     } catch (error) {
       return res.status(400).json({
         error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DAMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
       });
     }
 
@@ -778,14 +792,26 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       });
     }
 
-    // Validate poolAddress is a valid Solana public key (default to main pool if not provided)
-    const DEFAULT_POOL_ADDRESS = 'CCZdbVvDqPN8DmMLVELfnt9G1Q9pQNt3bTGifSpUY9Ad';
+    // Validate poolAddress is a valid Solana public key
+    if (!poolAddressInput) {
+      return res.status(400).json({
+        error: 'Missing required field: poolAddress'
+      });
+    }
+
     let poolAddress: PublicKey;
     try {
-      poolAddress = new PublicKey(poolAddressInput || DEFAULT_POOL_ADDRESS);
+      poolAddress = new PublicKey(poolAddressInput);
     } catch (error) {
       return res.status(400).json({
         error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DAMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
       });
     }
 

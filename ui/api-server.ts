@@ -30,6 +30,7 @@ import claimsRouter from './routes/claims';
 import presaleRouter from './routes/presale';
 import feeClaimRouter from './routes/fee-claim';
 import dammLiquidityRouter from './routes/damm-liquidity';
+import dlmmLiquidityRouter from './routes/dlmm-liquidity';
 import icoRouter from './routes/ico';
 
 dotenv.config();
@@ -103,6 +104,9 @@ app.use('/fee-claim', feeClaimRouter);
 
 // Mount DAMM liquidity routes
 app.use('/damm', dammLiquidityRouter);
+
+// Mount DLMM liquidity routes
+app.use('/dlmm', dlmmLiquidityRouter);
 
 // Mount ICO routes
 app.use('/ico', icoRouter);
@@ -362,6 +366,10 @@ async function startServer() {
       console.log(`  POST /damm/withdraw/confirm                 - Confirm DAMM withdrawal (manager only)`);
       console.log(`  POST /damm/deposit/build                    - Build DAMM liquidity deposit transaction`);
       console.log(`  POST /damm/deposit/confirm                  - Confirm DAMM deposit (manager only)`);
+      console.log(`  POST /dlmm/withdraw/build                   - Build DLMM liquidity withdrawal transaction`);
+      console.log(`  POST /dlmm/withdraw/confirm                 - Confirm DLMM withdrawal (manager only)`);
+      console.log(`  POST /dlmm/deposit/build                    - Build DLMM liquidity deposit transaction`);
+      console.log(`  POST /dlmm/deposit/confirm                  - Confirm DLMM deposit (manager only)`);
       console.log(`  GET  /claims/:tokenAddress                  - Get claim eligibility info`);
       console.log(`  POST /claims/mint                           - Create unsigned mint transaction`);
       console.log(`  POST /claims/confirm                        - Confirm claim transaction`);
