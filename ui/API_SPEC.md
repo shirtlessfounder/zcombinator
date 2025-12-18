@@ -100,9 +100,9 @@ Creates a new parent DAO with its own liquidity pool, treasury, and mint authori
 | `dao_pda` | `string` | The DAO's on-chain address |
 | `treasury_multisig` | `string` | 2-of-3 treasury multisig (you + 2 platform keys) |
 | `mint_multisig` | `string` | 2-of-2 mint authority multisig |
-| `admin_wallet` | `string` | DAO admin wallet (Combinator-controlled) |
+| `admin_wallet` | `string` | Wallet that manages the DAO and spot pool liquidity |
 
-**Important:** The `admin_wallet` is generated and controlled by Combinator. After creating a parent DAO, you must transfer LP tokens for your pool to the `admin_wallet` so that Combinator can create conditional markets when proposals are created.
+**Important:** The `admin_wallet` is generated internally and manages the DAO and spot pool liquidity. After creating a parent DAO, you must transfer LP tokens for your pool to the `admin_wallet` so that conditional markets can be created when proposals are submitted.
 
 **Example:**
 
@@ -125,7 +125,7 @@ curl -X POST https://api.combinator.xyz/dao/parent \
   "dao_pda": "DaoPdaAddress...",
   "treasury_multisig": "TreasuryMultisigAddress...",
   "mint_multisig": "MintMultisigAddress...",
-  "admin_wallet": "CombinatorControlledAdminWallet..."
+  "admin_wallet": "AdminWalletAddress..."
 }
 ```
 
@@ -151,7 +151,7 @@ Creates a child DAO under an existing parent. Child DAOs share the parent's liqu
 | `dao_pda` | `string` | The child DAO's on-chain address |
 | `treasury_multisig` | `string` | 2-of-3 treasury multisig (you + 2 platform keys) |
 | `mint_multisig` | `string` | 2-of-2 mint authority multisig |
-| `admin_wallet` | `string` | DAO admin wallet (Combinator-controlled) |
+| `admin_wallet` | `string` | Wallet that manages the DAO and spot pool liquidity |
 
 **Constraints:**
 
