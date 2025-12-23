@@ -74,18 +74,48 @@ interface DammDepositData {
   poolAddress: string;
   tokenAMint: string;
   tokenBMint: string;
-  tokenAVault: string;
-  tokenBVault: string;
+  tokenADecimals: number;
+  tokenBDecimals: number;
   lpOwnerAddress: string;
   managerAddress: string;
-  tokenAAmount: string;
-  tokenBAmount: string;
+  // Total amounts transferred from manager to LP owner
+  transferredTokenAAmount: string;
+  transferredTokenBAmount: string;
+  // Amounts actually deposited to DAMM (balanced at pool price)
+  depositedTokenAAmount: string;
+  depositedTokenBAmount: string;
+  // Amounts left over in LP owner wallet (for cleanup)
+  leftoverTokenAAmount: string;
+  leftoverTokenBAmount: string;
+  // Pool price used for balancing
+  poolPrice: number; // tokenB per tokenA
   liquidityDelta: string;
+  positionAddress: string;
+  timestamp: number;
+}
+
+interface DammCleanupSwapData {
+  unsignedTransaction: string;
+  unsignedTransactionHash: string;
+  poolAddress: string;
+  tokenAMint: string;
+  tokenBMint: string;
+  tokenADecimals: number;
+  tokenBDecimals: number;
+  lpOwnerAddress: string;
+  managerAddress: string;
+  // Swap details
+  swapInputMint: string;
+  swapInputAmount: string;
+  swapOutputMint: string;
+  swapExpectedOutputAmount: string;
+  swapDirection: 'AtoB' | 'BtoA';
   timestamp: number;
 }
 
 const withdrawRequests = new Map<string, DammWithdrawData>();
 const depositRequests = new Map<string, DammDepositData>();
+const cleanupSwapRequests = new Map<string, DammCleanupSwapData>();
 
 // Mutex locks for preventing concurrent processing
 const liquidityLocks = new Map<string, Promise<void>>();
@@ -126,6 +156,9 @@ const poolToTicker: Record<string, string> = {
 
 // Whitelisted DAMM pools
 const WHITELISTED_DAMM_POOLS = new Set(Object.keys(poolToTicker));
+
+// Restricted LP owner address - never allow cleanup swap or deposit using LP balances for this address
+const RESTRICTED_LP_OWNER = 'Hq7Xh37tT4sesD6wA4DphYfxeMJRhhFWS3KVUSSGjqzc';
 
 /**
  * Get the manager wallet address for a specific pool
@@ -212,7 +245,73 @@ setInterval(() => {
       depositRequests.delete(requestId);
     }
   }
+
+  for (const [requestId, data] of cleanupSwapRequests.entries()) {
+    if (now - data.timestamp > FIFTEEN_MINUTES) {
+      cleanupSwapRequests.delete(requestId);
+    }
+  }
 }, 5 * 60 * 1000);
+
+// ============================================================================
+// GET /damm/pool/:poolAddress/config - Get pool configuration (LP owner, manager)
+// ============================================================================
+/**
+ * Returns the LP owner and manager wallet addresses for a given pool
+ * Used by os-percent to know where to transfer tokens before cleanup
+ */
+router.get('/pool/:poolAddress/config', async (req: Request, res: Response) => {
+  try {
+    const { poolAddress: poolAddressInput } = req.params;
+
+    // Validate poolAddress is a valid Solana public key
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput);
+    } catch {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DAMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
+      });
+    }
+
+    // Get LP owner and manager wallet for this pool
+    let lpOwnerPrivateKey: string;
+    let managerWallet: string;
+    try {
+      lpOwnerPrivateKey = getLpOwnerPrivateKeyForPool(poolAddress.toBase58());
+      managerWallet = getManagerWalletForPool(poolAddress.toBase58());
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Derive LP owner public key from private key
+    const lpOwnerKeypair = Keypair.fromSecretKey(bs58.decode(lpOwnerPrivateKey));
+
+    return res.json({
+      success: true,
+      poolAddress: poolAddress.toBase58(),
+      lpOwnerAddress: lpOwnerKeypair.publicKey.toBase58(),
+      managerAddress: managerWallet
+    });
+
+  } catch (error) {
+    console.error('Error fetching pool config:', error);
+    return res.status(500).json({
+      error: 'Failed to fetch pool configuration',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
 
 // ============================================================================
 // POST /damm/withdraw/build - Build withdrawal transaction
@@ -785,13 +884,6 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 
     console.log('DAMM deposit build request received:', { tokenAAmount, tokenBAmount, poolAddress: poolAddressInput });
 
-    // Validate required fields
-    if (tokenAAmount === undefined || tokenBAmount === undefined) {
-      return res.status(400).json({
-        error: 'Missing required fields: tokenAAmount and tokenBAmount'
-      });
-    }
-
     // Validate poolAddress is a valid Solana public key
     if (!poolAddressInput) {
       return res.status(400).json({
@@ -815,17 +907,30 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       });
     }
 
-    // Validate amounts are numbers
-    if (typeof tokenAAmount !== 'number' || typeof tokenBAmount !== 'number') {
-      return res.status(400).json({
-        error: 'tokenAAmount and tokenBAmount must be numbers'
-      });
-    }
+    // Determine if we're using LP owner wallet balances (cleanup mode)
+    // Cleanup mode: tokenAAmount and tokenBAmount are both 0 or both undefined
+    const useCleanupMode = (tokenAAmount === 0 && tokenBAmount === 0) ||
+                           (tokenAAmount === undefined && tokenBAmount === undefined);
 
-    if (tokenAAmount < 0 || tokenBAmount < 0) {
-      return res.status(400).json({
-        error: 'Token amounts must be non-negative'
-      });
+    // Validate amounts if not in cleanup mode
+    if (!useCleanupMode) {
+      if (tokenAAmount === undefined || tokenBAmount === undefined) {
+        return res.status(400).json({
+          error: 'Missing required fields: tokenAAmount and tokenBAmount (or set both to 0 for cleanup mode)'
+        });
+      }
+
+      if (typeof tokenAAmount !== 'number' || typeof tokenBAmount !== 'number') {
+        return res.status(400).json({
+          error: 'tokenAAmount and tokenBAmount must be numbers'
+        });
+      }
+
+      if (tokenAAmount < 0 || tokenBAmount < 0) {
+        return res.status(400).json({
+          error: 'Token amounts must be non-negative'
+        });
+      }
     }
 
     // Validate environment variables
@@ -867,9 +972,61 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 
     const isTokenBNativeSOL = poolState.tokenBMint.equals(NATIVE_MINT);
 
-    // Convert UI amounts to raw amounts
-    const tokenAAmountRaw = new BN(Math.floor(tokenAAmount * Math.pow(10, tokenAMint.decimals)));
-    const tokenBAmountRaw = new BN(Math.floor(tokenBAmount * Math.pow(10, tokenBMint.decimals)));
+    // Determine deposit amounts - either from request or from LP owner wallet balances
+    let tokenAAmountRaw: BN;
+    let tokenBAmountRaw: BN;
+
+    if (useCleanupMode) {
+      console.log('  Using cleanup mode - reading LP owner wallet balances');
+
+      // SAFETY CHECK: Prevent deposit using LP balances for restricted LP owner address
+      if (lpOwner.publicKey.toBase58() === RESTRICTED_LP_OWNER) {
+        return res.status(403).json({
+          error: 'Deposit operations using LP owner balances are not permitted for this LP owner address'
+        });
+      }
+
+      // Get LP owner token balances
+      const lpOwnerTokenAAta = await getAssociatedTokenAddress(poolState.tokenAMint, lpOwner.publicKey, false, tokenAProgram);
+      const lpOwnerTokenBAta = isTokenBNativeSOL ? lpOwner.publicKey : await getAssociatedTokenAddress(poolState.tokenBMint, lpOwner.publicKey, false, tokenBProgram);
+
+      tokenAAmountRaw = new BN(0);
+      tokenBAmountRaw = new BN(0);
+
+      try {
+        const tokenAAccount = await connection.getTokenAccountBalance(lpOwnerTokenAAta);
+        tokenAAmountRaw = new BN(tokenAAccount.value.amount);
+      } catch {
+        // Account doesn't exist or has 0 balance
+      }
+
+      try {
+        if (isTokenBNativeSOL) {
+          const solBalance = await connection.getBalance(lpOwner.publicKey);
+          // Reserve some SOL for transaction fees (0.01 SOL)
+          const reserveForFees = 10_000_000;
+          tokenBAmountRaw = new BN(Math.max(0, solBalance - reserveForFees));
+        } else {
+          const tokenBAccount = await connection.getTokenAccountBalance(lpOwnerTokenBAta);
+          tokenBAmountRaw = new BN(tokenBAccount.value.amount);
+        }
+      } catch {
+        // Account doesn't exist or has 0 balance
+      }
+
+      console.log(`  LP Owner A Balance: ${tokenAAmountRaw.toString()}`);
+      console.log(`  LP Owner B Balance: ${tokenBAmountRaw.toString()}`);
+
+      if (tokenAAmountRaw.isZero() && tokenBAmountRaw.isZero()) {
+        return res.status(400).json({
+          error: 'No tokens available in LP owner wallet for cleanup deposit'
+        });
+      }
+    } else {
+      // Convert UI amounts to raw amounts
+      tokenAAmountRaw = new BN(Math.floor((tokenAAmount as number) * Math.pow(10, tokenAMint.decimals)));
+      tokenBAmountRaw = new BN(Math.floor((tokenBAmount as number) * Math.pow(10, tokenBMint.decimals)));
+    }
 
     // Get user positions
     const userPositions = await cpAmm.getUserPositionByPool(poolAddress, lpOwner.publicKey);
@@ -882,24 +1039,67 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 
     const { position, positionNftAccount } = userPositions[0];
 
-    // Calculate liquidity delta
+    // Calculate pool price from sqrtPrice (Q64.64 format)
+    // price = (sqrtPrice / 2^64)^2
+    const sqrtPriceNum = Number(poolState.sqrtPrice.toString());
+    const Q64 = Math.pow(2, 64);
+    const poolPrice = Math.pow(sqrtPriceNum / Q64, 2);
+
+    console.log(`  Pool price: ${poolPrice} B per A`);
+
+    // Calculate balanced deposit amounts using getDepositQuote
     const currentEpoch = await connection.getEpochInfo().then(e => e.epoch);
 
-    const liquidityDelta = cpAmm.getLiquidityDelta({
-      maxAmountTokenA: tokenAAmountRaw,
-      maxAmountTokenB: tokenBAmountRaw,
-      sqrtPrice: poolState.sqrtPrice,
-      sqrtMinPrice: poolState.sqrtMinPrice,
-      sqrtMaxPrice: poolState.sqrtMaxPrice,
-      tokenAInfo: {
-        mint: tokenAMint,
-        currentEpoch
-      },
-      tokenBInfo: {
-        mint: tokenBMint,
-        currentEpoch
-      }
+    // Try depositing all of token A first
+    const quoteFromA = cpAmm.getDepositQuote({
+      inAmount: tokenAAmountRaw,
+      isTokenA: true,
+      inputTokenInfo: { mint: tokenAMint, currentEpoch },
+      outputTokenInfo: { mint: tokenBMint, currentEpoch },
+      minSqrtPrice: poolState.sqrtMinPrice,
+      maxSqrtPrice: poolState.sqrtMaxPrice,
+      sqrtPrice: poolState.sqrtPrice
     });
+
+    let depositTokenAAmount: BN;
+    let depositTokenBAmount: BN;
+    let leftoverTokenAAmount: BN;
+    let leftoverTokenBAmount: BN;
+    let liquidityDelta: BN;
+
+    // Check if we can deposit all A with matching B
+    if (quoteFromA.outputAmount.lte(tokenBAmountRaw)) {
+      // Use all A, matching B amount, leave excess B
+      depositTokenAAmount = tokenAAmountRaw;
+      depositTokenBAmount = quoteFromA.outputAmount;
+      leftoverTokenAAmount = new BN(0);
+      leftoverTokenBAmount = tokenBAmountRaw.sub(quoteFromA.outputAmount);
+      liquidityDelta = quoteFromA.liquidityDelta;
+      console.log(`  Case: Excess tokenB - leaving ${leftoverTokenBAmount.toString()} B in LP wallet`);
+    } else {
+      // Use all B, matching A amount, leave excess A
+      const quoteFromB = cpAmm.getDepositQuote({
+        inAmount: tokenBAmountRaw,
+        isTokenA: false,
+        inputTokenInfo: { mint: tokenBMint, currentEpoch },
+        outputTokenInfo: { mint: tokenAMint, currentEpoch },
+        minSqrtPrice: poolState.sqrtMinPrice,
+        maxSqrtPrice: poolState.sqrtMaxPrice,
+        sqrtPrice: poolState.sqrtPrice
+      });
+      depositTokenAAmount = quoteFromB.outputAmount;
+      depositTokenBAmount = tokenBAmountRaw;
+      leftoverTokenAAmount = tokenAAmountRaw.sub(quoteFromB.outputAmount);
+      leftoverTokenBAmount = new BN(0);
+      liquidityDelta = quoteFromB.liquidityDelta;
+      console.log(`  Case: Excess tokenA - leaving ${leftoverTokenAAmount.toString()} A in LP wallet`);
+    }
+
+    console.log(`  Deposit A: ${depositTokenAAmount.toString()}`);
+    console.log(`  Deposit B: ${depositTokenBAmount.toString()}`);
+    console.log(`  Leftover A: ${leftoverTokenAAmount.toString()}`);
+    console.log(`  Leftover B: ${leftoverTokenBAmount.toString()}`);
+    console.log(`  Liquidity Delta: ${liquidityDelta.toString()}`);
 
     if (liquidityDelta.isZero()) {
       return res.status(400).json({
@@ -964,8 +1164,9 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       );
     }
 
-    // Add transfer instructions from manager to LP owner (skip if same wallet)
-    if (!isSameWallet) {
+    // Add transfer instructions from manager to LP owner
+    // Skip if: same wallet, or cleanup mode (tokens already in LP owner wallet)
+    if (!isSameWallet && !useCleanupMode) {
       if (!tokenAAmountRaw.isZero()) {
         combinedTx.add(
           createTransferInstruction(
@@ -1003,17 +1204,17 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       }
     }
 
-    // Add liquidity to position
+    // Add liquidity to position (using balanced deposit amounts)
     const addLiquidityTx = await cpAmm.addLiquidity({
       owner: lpOwner.publicKey,
       position,
       pool: poolAddress,
       positionNftAccount,
       liquidityDelta,
-      maxAmountTokenA: tokenAAmountRaw,
-      maxAmountTokenB: tokenBAmountRaw,
-      tokenAAmountThreshold: tokenAAmountRaw,
-      tokenBAmountThreshold: tokenBAmountRaw,
+      maxAmountTokenA: depositTokenAAmount,
+      maxAmountTokenB: depositTokenBAmount,
+      tokenAAmountThreshold: depositTokenAAmount.muln(95).divn(100), // 5% slippage tolerance
+      tokenBAmountThreshold: depositTokenBAmount.muln(95).divn(100),
       tokenAMint: poolState.tokenAMint,
       tokenBMint: poolState.tokenBMint,
       tokenAVault: poolState.tokenAVault,
@@ -1036,11 +1237,14 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
 
     console.log('✓ Deposit transaction built successfully');
     console.log(`  Pool: ${poolAddress.toBase58()}`);
-    console.log(`  Token A: ${tokenAAmount} (${tokenAAmountRaw.toString()} raw)`);
-    console.log(`  Token B: ${tokenBAmount} (${tokenBAmountRaw.toString()} raw)`);
+    console.log(`  Transferred: ${tokenAAmountRaw.toString()} A, ${tokenBAmountRaw.toString()} B`);
+    console.log(`  Deposited: ${depositTokenAAmount.toString()} A, ${depositTokenBAmount.toString()} B`);
+    console.log(`  Leftover: ${leftoverTokenAAmount.toString()} A, ${leftoverTokenBAmount.toString()} B`);
+    console.log(`  Pool Price: ${poolPrice}`);
     console.log(`  Liquidity Delta: ${liquidityDelta.toString()}`);
     console.log(`  Request ID: ${requestId}`);
-    console.log(`  TX Hash: ${unsignedTransactionHash.substring(0, 16)}...`);
+
+    const hasLeftover = !leftoverTokenAAmount.isZero() || !leftoverTokenBAmount.isZero();
 
     // Store transaction data
     depositRequests.set(requestId, {
@@ -1049,13 +1253,19 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       poolAddress: poolAddress.toBase58(),
       tokenAMint: poolState.tokenAMint.toBase58(),
       tokenBMint: poolState.tokenBMint.toBase58(),
-      tokenAVault: poolState.tokenAVault.toBase58(),
-      tokenBVault: poolState.tokenBVault.toBase58(),
+      tokenADecimals: tokenAMint.decimals,
+      tokenBDecimals: tokenBMint.decimals,
       lpOwnerAddress: lpOwner.publicKey.toBase58(),
       managerAddress: managerWallet.toBase58(),
-      tokenAAmount: tokenAAmountRaw.toString(),
-      tokenBAmount: tokenBAmountRaw.toString(),
+      transferredTokenAAmount: tokenAAmountRaw.toString(),
+      transferredTokenBAmount: tokenBAmountRaw.toString(),
+      depositedTokenAAmount: depositTokenAAmount.toString(),
+      depositedTokenBAmount: depositTokenBAmount.toString(),
+      leftoverTokenAAmount: leftoverTokenAAmount.toString(),
+      leftoverTokenBAmount: leftoverTokenBAmount.toString(),
+      poolPrice,
       liquidityDelta: liquidityDelta.toString(),
+      positionAddress: position.toBase58(),
       timestamp: Date.now()
     });
 
@@ -1066,14 +1276,28 @@ router.post('/deposit/build', dammLiquidityLimiter, async (req: Request, res: Re
       poolAddress: poolAddress.toBase58(),
       tokenAMint: poolState.tokenAMint.toBase58(),
       tokenBMint: poolState.tokenBMint.toBase58(),
+      tokenADecimals: tokenAMint.decimals,
+      tokenBDecimals: tokenBMint.decimals,
       isTokenBNativeSOL,
-      instructionsCount: combinedTx.instructions.length,
-      amounts: {
+      cleanupMode: useCleanupMode,
+      poolPrice,
+      hasLeftover,
+      transferred: {
         tokenA: tokenAAmountRaw.toString(),
         tokenB: tokenBAmountRaw.toString(),
+      },
+      deposited: {
+        tokenA: depositTokenAAmount.toString(),
+        tokenB: depositTokenBAmount.toString(),
         liquidityDelta: liquidityDelta.toString()
       },
-      message: 'Sign this transaction with the manager wallet and submit to /damm/deposit/confirm'
+      leftover: {
+        tokenA: leftoverTokenAAmount.toString(),
+        tokenB: leftoverTokenBAmount.toString(),
+      },
+      message: hasLeftover
+        ? 'Sign this transaction with the manager wallet and submit to /damm/deposit/confirm. Note: leftover tokens will remain in LP owner wallet for cleanup.'
+        : 'Sign this transaction with the manager wallet and submit to /damm/deposit/confirm'
     });
 
   } catch (error) {
@@ -1263,8 +1487,9 @@ router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: 
     console.log(`  Pool: ${depositData.poolAddress}`);
     console.log(`  Manager: ${depositData.managerAddress}`);
     console.log(`  LP Owner: ${depositData.lpOwnerAddress}`);
-    console.log(`  Token A: ${depositData.tokenAMint} (${depositData.tokenAAmount} raw)`);
-    console.log(`  Token B: ${depositData.tokenBMint} (${depositData.tokenBAmount} raw)`);
+    console.log(`  Transferred: ${depositData.transferredTokenAAmount} A, ${depositData.transferredTokenBAmount} B`);
+    console.log(`  Deposited: ${depositData.depositedTokenAAmount} A, ${depositData.depositedTokenBAmount} B`);
+    console.log(`  Leftover: ${depositData.leftoverTokenAAmount} A, ${depositData.leftoverTokenBAmount} B`);
     console.log(`  Liquidity Delta: ${depositData.liquidityDelta}`);
     console.log(`  Solscan: https://solscan.io/tx/${signature}`);
 
@@ -1283,24 +1508,535 @@ router.post('/deposit/confirm', dammLiquidityLimiter, async (req: Request, res: 
     // Clean up
     depositRequests.delete(requestId);
 
+    const hasLeftover = depositData.leftoverTokenAAmount !== '0' || depositData.leftoverTokenBAmount !== '0';
+
     res.json({
       success: true,
       signature,
       poolAddress: depositData.poolAddress,
       tokenAMint: depositData.tokenAMint,
       tokenBMint: depositData.tokenBMint,
-      amounts: {
-        tokenA: depositData.tokenAAmount,
-        tokenB: depositData.tokenBAmount,
+      tokenADecimals: depositData.tokenADecimals,
+      tokenBDecimals: depositData.tokenBDecimals,
+      poolPrice: depositData.poolPrice,
+      hasLeftover,
+      transferred: {
+        tokenA: depositData.transferredTokenAAmount,
+        tokenB: depositData.transferredTokenBAmount,
+      },
+      deposited: {
+        tokenA: depositData.depositedTokenAAmount,
+        tokenB: depositData.depositedTokenBAmount,
         liquidityDelta: depositData.liquidityDelta
       },
-      message: 'Deposit transaction submitted successfully'
+      leftover: {
+        tokenA: depositData.leftoverTokenAAmount,
+        tokenB: depositData.leftoverTokenBAmount,
+      },
+      message: hasLeftover
+        ? 'Deposit transaction submitted successfully. Leftover tokens remain in LP owner wallet for cleanup.'
+        : 'Deposit transaction submitted successfully'
     });
 
   } catch (error) {
     console.error('Deposit confirm error:', error);
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to confirm deposit'
+    });
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+  }
+});
+
+// ============================================================================
+// POST /damm/cleanup/swap/build - Build swap transaction for leftover tokens
+// ============================================================================
+/**
+ * Cleanup swap endpoint - Step 1 of cleanup process
+ *
+ * This endpoint:
+ * 1. Reads LP owner's token balances
+ * 2. Determines which token is in excess based on pool price
+ * 3. Fetches Jupiter quote for swapping excess token
+ * 4. Returns unsigned swap transaction for manager to sign
+ */
+router.post('/cleanup/swap/build', dammLiquidityLimiter, async (req: Request, res: Response) => {
+  try {
+    const { poolAddress: poolAddressInput } = req.body;
+
+    console.log('DAMM cleanup swap build request received:', { poolAddress: poolAddressInput });
+
+    // Validate poolAddress
+    if (!poolAddressInput) {
+      return res.status(400).json({
+        error: 'Missing required field: poolAddress'
+      });
+    }
+
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput);
+    } catch {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DAMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
+      });
+    }
+
+    // Validate environment variables
+    const RPC_URL = process.env.RPC_URL;
+    const JUP_API_KEY = process.env.JUP_API_KEY;
+    if (!RPC_URL) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete. Missing RPC_URL.'
+      });
+    }
+
+    // Get pool-specific LP owner and manager wallet
+    let LP_OWNER_PRIVATE_KEY: string;
+    let MANAGER_WALLET: string;
+    try {
+      LP_OWNER_PRIVATE_KEY = getLpOwnerPrivateKeyForPool(poolAddress.toBase58());
+      MANAGER_WALLET = getManagerWalletForPool(poolAddress.toBase58());
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Initialize connection and keypairs
+    const connection = new Connection(RPC_URL, 'confirmed');
+    const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
+    const manager = new PublicKey(MANAGER_WALLET);
+
+    // SAFETY CHECK: Prevent cleanup swap for restricted LP owner address
+    if (lpOwner.publicKey.toBase58() === RESTRICTED_LP_OWNER) {
+      return res.status(403).json({
+        error: 'Cleanup swap operations are not permitted for this LP owner address'
+      });
+    }
+
+    // Create CpAmm instance and get pool state
+    const cpAmm = new CpAmm(connection);
+    const poolState = await cpAmm.fetchPoolState(poolAddress);
+
+    const tokenAMint = poolState.tokenAMint;
+    const tokenBMint = poolState.tokenBMint;
+
+    // Get token mint info
+    const tokenAMintInfo = await getMint(connection, tokenAMint);
+    const tokenBMintInfo = await getMint(connection, tokenBMint);
+    const tokenAProgram = getTokenProgram(tokenAMintInfo.tlvData.length > 0 ? 1 : 0);
+    const tokenBProgram = getTokenProgram(tokenBMintInfo.tlvData.length > 0 ? 1 : 0);
+    const isTokenBNativeSOL = tokenBMint.equals(NATIVE_MINT);
+
+    console.log(`  Token A Mint: ${tokenAMint.toBase58()} (decimals: ${tokenAMintInfo.decimals})`);
+    console.log(`  Token B Mint: ${tokenBMint.toBase58()} (decimals: ${tokenBMintInfo.decimals})`);
+
+    // Get LP owner token balances
+    const lpOwnerTokenAAta = await getAssociatedTokenAddress(tokenAMint, lpOwner.publicKey, false, tokenAProgram);
+    const lpOwnerTokenBAta = isTokenBNativeSOL ? lpOwner.publicKey : await getAssociatedTokenAddress(tokenBMint, lpOwner.publicKey, false, tokenBProgram);
+
+    let tokenABalance = new BN(0);
+    let tokenBBalance = new BN(0);
+
+    try {
+      const tokenAAccount = await connection.getTokenAccountBalance(lpOwnerTokenAAta);
+      tokenABalance = new BN(tokenAAccount.value.amount);
+    } catch {
+      // Account doesn't exist or has 0 balance
+    }
+
+    try {
+      if (isTokenBNativeSOL) {
+        // For native SOL, check the account balance
+        const solBalance = await connection.getBalance(lpOwner.publicKey);
+        // Reserve some SOL for transaction fees (0.01 SOL)
+        const reserveForFees = 10_000_000; // 0.01 SOL in lamports
+        tokenBBalance = new BN(Math.max(0, solBalance - reserveForFees));
+      } else {
+        const tokenBAccount = await connection.getTokenAccountBalance(lpOwnerTokenBAta);
+        tokenBBalance = new BN(tokenBAccount.value.amount);
+      }
+    } catch {
+      // Account doesn't exist or has 0 balance
+    }
+
+    console.log(`  LP Owner A Balance: ${tokenABalance.toString()}`);
+    console.log(`  LP Owner B Balance: ${tokenBBalance.toString()}`);
+
+    // Check if there's anything to clean up
+    if (tokenABalance.isZero() && tokenBBalance.isZero()) {
+      return res.status(400).json({
+        error: 'No leftover tokens to clean up',
+        balances: {
+          tokenA: '0',
+          tokenB: '0'
+        }
+      });
+    }
+
+    // Calculate pool price from sqrtPrice
+    // sqrtPrice is in Q64.64 format, so actual price = (sqrtPrice / 2^64)^2
+    const sqrtPriceNum = Number(poolState.sqrtPrice.toString());
+    const Q64 = Math.pow(2, 64);
+    const poolPrice = Math.pow(sqrtPriceNum / Q64, 2);
+
+    console.log(`  Pool Price: ${poolPrice} (B per A)`);
+
+    // Determine which token is in excess and needs to be swapped
+    const tokenADecimal = Number(tokenABalance.toString()) / Math.pow(10, tokenAMintInfo.decimals);
+    const tokenBDecimal = Number(tokenBBalance.toString()) / Math.pow(10, tokenBMintInfo.decimals);
+
+    // Calculate what we'd need of each token for a balanced deposit
+    // At price P (B per A): B = A * P
+    const neededBForAllA = tokenADecimal * poolPrice;
+    const neededAForAllB = tokenBDecimal / poolPrice;
+
+    let swapInputMint: PublicKey;
+    let swapOutputMint: PublicKey;
+    let swapInputAmount: BN;
+    let swapDirection: 'AtoB' | 'BtoA';
+
+    if (neededBForAllA > tokenBDecimal) {
+      // We have excess A, need to swap some A for B
+      // Swap HALF the excess - heuristic to account for price impact moving toward our ratio
+      const excessADecimal = tokenADecimal - neededAForAllB;
+      const swapADecimal = excessADecimal / 2;
+      swapInputAmount = new BN(Math.floor(swapADecimal * Math.pow(10, tokenAMintInfo.decimals)));
+      swapInputMint = tokenAMint;
+      swapOutputMint = tokenBMint;
+      swapDirection = 'AtoB';
+      console.log(`  Swap direction: A → B (excess: ${excessADecimal}, swapping half: ${swapADecimal} A)`);
+    } else {
+      // We have excess B, need to swap some B for A
+      // Swap HALF the excess - heuristic to account for price impact moving toward our ratio
+      const excessBDecimal = tokenBDecimal - neededBForAllA;
+      const swapBDecimal = excessBDecimal / 2;
+      swapInputAmount = new BN(Math.floor(swapBDecimal * Math.pow(10, tokenBMintInfo.decimals)));
+      swapInputMint = tokenBMint;
+      swapOutputMint = tokenAMint;
+      swapDirection = 'BtoA';
+      console.log(`  Swap direction: B → A (excess: ${excessBDecimal}, swapping half: ${swapBDecimal} B)`);
+    }
+
+    if (swapInputAmount.isZero()) {
+      return res.status(400).json({
+        error: 'Leftover amounts are too small to warrant cleanup',
+        balances: {
+          tokenA: tokenABalance.toString(),
+          tokenB: tokenBBalance.toString()
+        }
+      });
+    }
+
+    // Fetch Jupiter quote
+    console.log('  Fetching Jupiter quote...');
+    const jupiterHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (JUP_API_KEY) {
+      jupiterHeaders['x-api-key'] = JUP_API_KEY;
+    }
+
+    const quoteResponse = await fetch(
+      `https://quote-api.jup.ag/v6/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100`,
+      { headers: jupiterHeaders }
+    );
+
+    if (!quoteResponse.ok) {
+      return res.status(500).json({
+        error: 'Failed to fetch Jupiter quote',
+        details: await quoteResponse.text()
+      });
+    }
+
+    const quoteData = await quoteResponse.json();
+    const expectedOutputAmount = quoteData.outAmount;
+
+    console.log(`  Jupiter quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
+
+    // Fetch Jupiter swap transaction
+    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+      method: 'POST',
+      headers: jupiterHeaders,
+      body: JSON.stringify({
+        quoteResponse: quoteData,
+        userPublicKey: lpOwner.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: 'auto'
+      })
+    });
+
+    if (!swapResponse.ok) {
+      return res.status(500).json({
+        error: 'Failed to fetch Jupiter swap transaction',
+        details: await swapResponse.text()
+      });
+    }
+
+    const swapData = await swapResponse.json();
+    const swapTransactionBase64 = swapData.swapTransaction;
+
+    // Decode the swap transaction
+    const swapTransactionBuffer = Buffer.from(swapTransactionBase64, 'base64');
+    const swapTransaction = Transaction.from(swapTransactionBuffer);
+
+    // Set transaction properties
+    const { blockhash } = await connection.getLatestBlockhash();
+
+    // Update swap transaction with manager as fee payer
+    swapTransaction.recentBlockhash = blockhash;
+    swapTransaction.feePayer = manager;
+
+    // Serialize transaction
+    const unsignedSwapTx = bs58.encode(swapTransaction.serialize({ requireAllSignatures: false }));
+    const swapTxHash = crypto.createHash('sha256').update(swapTransaction.serializeMessage()).digest('hex');
+
+    // Generate request ID
+    const requestId = crypto.randomBytes(16).toString('hex');
+
+    console.log('✓ DAMM cleanup swap transaction built successfully');
+    console.log(`  Pool: ${poolAddress.toBase58()}`);
+    console.log(`  Swap: ${swapInputAmount.toString()} ${swapDirection === 'AtoB' ? 'A→B' : 'B→A'}`);
+    console.log(`  Expected output: ${expectedOutputAmount}`);
+    console.log(`  Request ID: ${requestId}`);
+
+    // Store request data
+    cleanupSwapRequests.set(requestId, {
+      unsignedTransaction: unsignedSwapTx,
+      unsignedTransactionHash: swapTxHash,
+      poolAddress: poolAddress.toBase58(),
+      tokenAMint: tokenAMint.toBase58(),
+      tokenBMint: tokenBMint.toBase58(),
+      tokenADecimals: tokenAMintInfo.decimals,
+      tokenBDecimals: tokenBMintInfo.decimals,
+      lpOwnerAddress: lpOwner.publicKey.toBase58(),
+      managerAddress: manager.toBase58(),
+      swapInputMint: swapInputMint.toBase58(),
+      swapInputAmount: swapInputAmount.toString(),
+      swapOutputMint: swapOutputMint.toBase58(),
+      swapExpectedOutputAmount: expectedOutputAmount,
+      swapDirection,
+      timestamp: Date.now()
+    });
+
+    return res.json({
+      success: true,
+      transaction: unsignedSwapTx,
+      requestId,
+      poolAddress: poolAddress.toBase58(),
+      tokenAMint: tokenAMint.toBase58(),
+      tokenBMint: tokenBMint.toBase58(),
+      tokenADecimals: tokenAMintInfo.decimals,
+      tokenBDecimals: tokenBMintInfo.decimals,
+      lpOwnerAddress: lpOwner.publicKey.toBase58(),
+      managerAddress: manager.toBase58(),
+      poolPrice,
+      balances: {
+        tokenA: tokenABalance.toString(),
+        tokenB: tokenBBalance.toString(),
+      },
+      swap: {
+        inputMint: swapInputMint.toBase58(),
+        inputAmount: swapInputAmount.toString(),
+        outputMint: swapOutputMint.toBase58(),
+        expectedOutputAmount,
+        direction: swapDirection
+      },
+      message: 'Sign this transaction with the manager wallet and submit to /damm/cleanup/swap/confirm. After swap completes, call /damm/deposit/build with tokenAAmount=0 and tokenBAmount=0 to deposit LP owner wallet balances.'
+    });
+
+  } catch (error) {
+    console.error('Error building DAMM cleanup swap transaction:', error);
+    return res.status(500).json({
+      error: 'Failed to build cleanup swap transaction',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// ============================================================================
+// POST /damm/cleanup/swap/confirm - Confirm and submit swap transaction
+// ============================================================================
+/**
+ * Cleanup swap confirm - Step 2 of cleanup process
+ *
+ * Security measures:
+ * 1. Manager wallet signature verification
+ * 2. Lock system - Prevents concurrent operations
+ * 3. Request expiry - 10 minute timeout
+ * 4. Transaction hash validation - Prevents tampering
+ */
+router.post('/cleanup/swap/confirm', dammLiquidityLimiter, async (req: Request, res: Response) => {
+  let releaseLock: (() => void) | null = null;
+
+  try {
+    const { signedTransaction, requestId } = req.body;
+
+    console.log('DAMM cleanup swap confirm request received:', { requestId });
+
+    // Validate required fields
+    if (!signedTransaction || !requestId) {
+      return res.status(400).json({
+        error: 'Missing required fields: signedTransaction and requestId'
+      });
+    }
+
+    // Retrieve request data
+    const requestData = cleanupSwapRequests.get(requestId);
+    if (!requestData) {
+      return res.status(400).json({
+        error: 'Cleanup swap request not found or expired. Please call /damm/cleanup/swap/build first.'
+      });
+    }
+
+    console.log('  Pool:', requestData.poolAddress);
+    console.log('  Manager:', requestData.managerAddress);
+    console.log('  LP Owner:', requestData.lpOwnerAddress);
+
+    // Acquire lock
+    releaseLock = await acquireLiquidityLock(requestData.poolAddress);
+    console.log('  Lock acquired');
+
+    // Check request age
+    const TEN_MINUTES = 10 * 60 * 1000;
+    if (Date.now() - requestData.timestamp > TEN_MINUTES) {
+      cleanupSwapRequests.delete(requestId);
+      return res.status(400).json({
+        error: 'Cleanup swap request expired. Please create a new request.'
+      });
+    }
+
+    // Validate environment variables
+    const RPC_URL = process.env.RPC_URL;
+    let LP_OWNER_PRIVATE_KEY: string;
+
+    try {
+      LP_OWNER_PRIVATE_KEY = getLpOwnerPrivateKeyForPool(requestData.poolAddress);
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Initialize connection
+    const connection = new Connection(RPC_URL!, 'confirmed');
+    const lpOwnerKeypair = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
+    const managerWalletPubKey = new PublicKey(requestData.managerAddress);
+
+    // Deserialize transaction
+    let transaction: Transaction;
+    try {
+      const transactionBuffer = bs58.decode(signedTransaction);
+      transaction = Transaction.from(transactionBuffer);
+    } catch (error) {
+      return res.status(400).json({
+        error: `Failed to deserialize transaction: ${error instanceof Error ? error.message : 'Unknown error'}`
+      });
+    }
+
+    // SECURITY: Verify manager wallet has signed
+    const managerSignature = transaction.signatures.find(sig =>
+      sig.publicKey.equals(managerWalletPubKey)
+    );
+
+    if (!managerSignature || !managerSignature.signature) {
+      return res.status(400).json({
+        error: 'Transaction verification failed: Manager wallet has not signed'
+      });
+    }
+
+    // Verify manager signature is valid
+    const messageData = transaction.serializeMessage();
+    const managerSigValid = nacl.sign.detached.verify(
+      messageData,
+      managerSignature.signature,
+      managerSignature.publicKey.toBytes()
+    );
+
+    if (!managerSigValid) {
+      return res.status(400).json({
+        error: 'Transaction verification failed: Invalid manager wallet signature'
+      });
+    }
+
+    // SECURITY: Verify transaction hasn't been tampered with
+    const receivedTransactionHash = crypto.createHash('sha256')
+      .update(transaction.serializeMessage())
+      .digest('hex');
+
+    if (receivedTransactionHash !== requestData.unsignedTransactionHash) {
+      console.log('  ⚠️  Transaction hash mismatch detected');
+      return res.status(400).json({
+        error: 'Transaction verification failed: transaction has been modified'
+      });
+    }
+    console.log('  ✓ Transaction integrity verified');
+
+    // Add LP owner signature
+    transaction.partialSign(lpOwnerKeypair);
+
+    // Send transaction
+    console.log('  Sending swap transaction...');
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+
+    console.log(`  ✓ Swap transaction sent: ${signature}`);
+
+    // Wait for confirmation
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    try {
+      await connection.confirmTransaction({
+        signature,
+        blockhash,
+        lastValidBlockHeight
+      });
+      console.log(`  ✓ Swap confirmed: ${signature}`);
+    } catch (error) {
+      console.error(`  ⚠ Swap confirmation timeout for ${signature}:`, error);
+    }
+
+    console.log('✓ DAMM cleanup swap completed');
+    console.log(`  Signature: ${signature}`);
+    console.log(`  Pool: ${requestData.poolAddress}`);
+
+    // Clean up
+    cleanupSwapRequests.delete(requestId);
+
+    res.json({
+      success: true,
+      signature,
+      poolAddress: requestData.poolAddress,
+      tokenAMint: requestData.tokenAMint,
+      tokenBMint: requestData.tokenBMint,
+      swap: {
+        inputMint: requestData.swapInputMint,
+        inputAmount: requestData.swapInputAmount,
+        outputMint: requestData.swapOutputMint,
+        expectedOutputAmount: requestData.swapExpectedOutputAmount,
+        direction: requestData.swapDirection
+      },
+      message: 'Swap transaction submitted successfully. Call /damm/deposit/build with tokenAAmount=0 and tokenBAmount=0 to deposit LP owner wallet balances.'
+    });
+
+  } catch (error) {
+    console.error('DAMM cleanup swap confirm error:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to confirm cleanup swap'
     });
   } finally {
     if (releaseLock) {

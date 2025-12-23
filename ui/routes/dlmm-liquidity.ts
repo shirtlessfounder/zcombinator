@@ -85,16 +85,48 @@ interface DlmmDepositData {
   poolAddress: string;
   tokenXMint: string;
   tokenYMint: string;
+  tokenXDecimals: number;
+  tokenYDecimals: number;
   lpOwnerAddress: string;
   managerAddress: string;
-  tokenXAmount: string;
-  tokenYAmount: string;
+  // Total amounts transferred from manager to LP owner
+  transferredTokenXAmount: string;
+  transferredTokenYAmount: string;
+  // Amounts actually deposited to DLMM (balanced at pool price)
+  depositedTokenXAmount: string;
+  depositedTokenYAmount: string;
+  // Amounts left over in LP owner wallet (for cleanup)
+  leftoverTokenXAmount: string;
+  leftoverTokenYAmount: string;
+  // Pool price used for balancing
+  activeBinPrice: number; // tokenY per tokenX
   positionAddress: string;
+  timestamp: number;
+}
+
+interface DlmmCleanupSwapData {
+  unsignedTransaction: string;
+  unsignedTransactionHash: string;
+  poolAddress: string;
+  tokenXMint: string;
+  tokenYMint: string;
+  tokenXDecimals: number;
+  tokenYDecimals: number;
+  lpOwnerAddress: string;
+  managerAddress: string;
+  activeBinPrice: number;
+  // Swap details
+  swapInputMint: string;
+  swapInputAmount: string;
+  swapOutputMint: string;
+  swapExpectedOutputAmount: string;
+  swapDirection: 'XtoY' | 'YtoX';
   timestamp: number;
 }
 
 const withdrawRequests = new Map<string, DlmmWithdrawData>();
 const depositRequests = new Map<string, DlmmDepositData>();
+const cleanupSwapRequests = new Map<string, DlmmCleanupSwapData>();
 
 // Mutex locks for preventing concurrent processing
 const liquidityLocks = new Map<string, Promise<void>>();
@@ -129,6 +161,9 @@ const poolToTicker: Record<string, string> = {
 
 // Whitelisted DLMM pools
 const WHITELISTED_DLMM_POOLS = new Set(Object.keys(poolToTicker));
+
+// Restricted LP owner address - never allow cleanup swap or deposit using LP balances for this address
+const RESTRICTED_LP_OWNER = 'Hq7Xh37tT4sesD6wA4DphYfxeMJRhhFWS3KVUSSGjqzc';
 
 /**
  * Get the manager wallet address for a specific pool
@@ -186,7 +221,73 @@ setInterval(() => {
       depositRequests.delete(requestId);
     }
   }
+
+  for (const [requestId, data] of cleanupSwapRequests.entries()) {
+    if (now - data.timestamp > FIFTEEN_MINUTES) {
+      cleanupSwapRequests.delete(requestId);
+    }
+  }
 }, 5 * 60 * 1000);
+
+// ============================================================================
+// GET /dlmm/pool/:poolAddress/config - Get pool configuration (LP owner, manager)
+// ============================================================================
+/**
+ * Returns the LP owner and manager wallet addresses for a given pool
+ * Used by os-percent to know where to transfer tokens before cleanup
+ */
+router.get('/pool/:poolAddress/config', async (req: Request, res: Response) => {
+  try {
+    const { poolAddress: poolAddressInput } = req.params;
+
+    // Validate poolAddress is a valid Solana public key
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput);
+    } catch {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DLMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
+      });
+    }
+
+    // Get LP owner and manager wallet for this pool
+    let lpOwnerPrivateKey: string;
+    let managerWallet: string;
+    try {
+      lpOwnerPrivateKey = getLpOwnerPrivateKeyForPool(poolAddress.toBase58());
+      managerWallet = getManagerWalletForPool(poolAddress.toBase58());
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Derive LP owner public key from private key
+    const lpOwnerKeypair = Keypair.fromSecretKey(bs58.decode(lpOwnerPrivateKey));
+
+    return res.json({
+      success: true,
+      poolAddress: poolAddress.toBase58(),
+      lpOwnerAddress: lpOwnerKeypair.publicKey.toBase58(),
+      managerAddress: managerWallet
+    });
+
+  } catch (error) {
+    console.error('Error fetching DLMM pool config:', error);
+    return res.status(500).json({
+      error: 'Failed to fetch pool configuration',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
 
 // ============================================================================
 // Jupiter Price API Helper
@@ -993,11 +1094,9 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
       });
     }
 
-    if ((!tokenXAmount || tokenXAmount === '0') && (!tokenYAmount || tokenYAmount === '0')) {
-      return res.status(400).json({
-        error: 'At least one of tokenXAmount or tokenYAmount must be provided and greater than 0'
-      });
-    }
+    // Determine if we're using LP owner wallet balances (cleanup mode)
+    // Cleanup mode: both tokenXAmount and tokenYAmount are 0 or undefined
+    const useCleanupMode = (!tokenXAmount || tokenXAmount === '0') && (!tokenYAmount || tokenYAmount === '0');
 
     // Validate poolAddress
     let poolAddress: PublicKey;
@@ -1059,9 +1158,69 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
     console.log(`  Token X Mint: ${tokenXMint.toBase58()} (decimals: ${tokenXMintInfo.decimals})`);
     console.log(`  Token Y Mint: ${tokenYMint.toBase58()} (decimals: ${tokenYMintInfo.decimals})`);
 
-    // Parse amounts
-    const tokenXAmountBN = new BN(tokenXAmount || '0');
-    const tokenYAmountBN = new BN(tokenYAmount || '0');
+    // Get LP owner ATAs
+    const lpOwnerTokenXAta = await getAssociatedTokenAddress(tokenXMint, lpOwner.publicKey);
+    const lpOwnerTokenYAta = await getAssociatedTokenAddress(tokenYMint, lpOwner.publicKey);
+
+    // Determine deposit amounts - either from request or from LP owner wallet balances
+    let tokenXAmountBN: BN;
+    let tokenYAmountBN: BN;
+
+    if (useCleanupMode) {
+      console.log('  Using cleanup mode - reading LP owner wallet balances');
+
+      // SAFETY CHECK: Prevent deposit using LP balances for restricted LP owner address
+      if (lpOwner.publicKey.toBase58() === RESTRICTED_LP_OWNER) {
+        return res.status(403).json({
+          error: 'Deposit operations using LP owner balances are not permitted for this LP owner address'
+        });
+      }
+
+      tokenXAmountBN = new BN(0);
+      tokenYAmountBN = new BN(0);
+
+      try {
+        const tokenXAccount = await connection.getTokenAccountBalance(lpOwnerTokenXAta);
+        tokenXAmountBN = new BN(tokenXAccount.value.amount);
+      } catch {
+        // Account doesn't exist or has 0 balance
+      }
+
+      try {
+        if (isTokenYNativeSOL) {
+          const solBalance = await connection.getBalance(lpOwner.publicKey);
+          // Reserve some SOL for transaction fees (0.01 SOL)
+          const reserveForFees = 10_000_000; // 0.01 SOL in lamports
+          tokenYAmountBN = new BN(Math.max(0, solBalance - reserveForFees));
+
+          // Also check wSOL ATA if it exists
+          try {
+            const wsolAccount = await connection.getTokenAccountBalance(lpOwnerTokenYAta);
+            tokenYAmountBN = tokenYAmountBN.add(new BN(wsolAccount.value.amount));
+          } catch {
+            // wSOL ATA doesn't exist
+          }
+        } else {
+          const tokenYAccount = await connection.getTokenAccountBalance(lpOwnerTokenYAta);
+          tokenYAmountBN = new BN(tokenYAccount.value.amount);
+        }
+      } catch {
+        // Account doesn't exist or has 0 balance
+      }
+
+      console.log(`  LP Owner X Balance: ${tokenXAmountBN.toString()}`);
+      console.log(`  LP Owner Y Balance: ${tokenYAmountBN.toString()}`);
+
+      if (tokenXAmountBN.isZero() && tokenYAmountBN.isZero()) {
+        return res.status(400).json({
+          error: 'No tokens available in LP owner wallet for cleanup deposit'
+        });
+      }
+    } else {
+      // Parse amounts from request
+      tokenXAmountBN = new BN(tokenXAmount || '0');
+      tokenYAmountBN = new BN(tokenYAmount || '0');
+    }
 
     // Get user positions
     const { userPositions, activeBin } = await dlmmPool.getPositionsByUserAndLbPair(lpOwner.publicKey);
@@ -1077,16 +1236,68 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
 
     console.log(`  Position: ${position.publicKey.toBase58()}`);
     console.log(`  Active Bin: ${activeBin.binId}`);
+    console.log(`  Active Bin Price (per token): ${activeBin.pricePerToken}`);
     console.log(`  Position Range: ${positionData.lowerBinId} - ${positionData.upperBinId}`);
+
+    // =========================================================================
+    // Calculate balanced deposit amounts based on active bin price
+    // =========================================================================
+    // Active bin price is tokenY per tokenX (e.g., SOL per ZC)
+    // We need to determine which token is in excess and only deposit balanced amounts
+    const activeBinPrice = parseFloat(activeBin.pricePerToken);
+
+    // Convert requested amounts to decimal for calculations
+    const requestedXDecimal = Number(tokenXAmountBN.toString()) / Math.pow(10, tokenXMintInfo.decimals);
+    const requestedYDecimal = Number(tokenYAmountBN.toString()) / Math.pow(10, tokenYMintInfo.decimals);
+
+    console.log(`  Requested X (decimal): ${requestedXDecimal}`);
+    console.log(`  Requested Y (decimal): ${requestedYDecimal}`);
+    console.log(`  Active bin price: ${activeBinPrice} Y per X`);
+
+    // Calculate balanced amounts
+    // Option A: Use all X, calculate needed Y
+    const neededYForAllX = requestedXDecimal * activeBinPrice;
+    // Option B: Use all Y, calculate needed X
+    const neededXForAllY = requestedYDecimal / activeBinPrice;
+
+    let depositXDecimal: number;
+    let depositYDecimal: number;
+    let leftoverXDecimal: number;
+    let leftoverYDecimal: number;
+
+    if (neededYForAllX <= requestedYDecimal) {
+      // We have excess tokenY - use all tokenX, deposit matching tokenY, leave excess Y
+      depositXDecimal = requestedXDecimal;
+      depositYDecimal = neededYForAllX;
+      leftoverXDecimal = 0;
+      leftoverYDecimal = requestedYDecimal - neededYForAllX;
+      console.log(`  Case: Excess tokenY - leaving ${leftoverYDecimal} Y in LP wallet`);
+    } else {
+      // We have excess tokenX - use all tokenY, deposit matching tokenX, leave excess X
+      depositXDecimal = neededXForAllY;
+      depositYDecimal = requestedYDecimal;
+      leftoverXDecimal = requestedXDecimal - neededXForAllY;
+      leftoverYDecimal = 0;
+      console.log(`  Case: Excess tokenX - leaving ${leftoverXDecimal} X in LP wallet`);
+    }
+
+    // Convert back to raw amounts (BN)
+    const depositTokenXAmount = new BN(Math.floor(depositXDecimal * Math.pow(10, tokenXMintInfo.decimals)));
+    const depositTokenYAmount = new BN(Math.floor(depositYDecimal * Math.pow(10, tokenYMintInfo.decimals)));
+    const leftoverTokenXAmount = new BN(Math.floor(leftoverXDecimal * Math.pow(10, tokenXMintInfo.decimals)));
+    const leftoverTokenYAmount = new BN(Math.floor(leftoverYDecimal * Math.pow(10, tokenYMintInfo.decimals)));
+
+    console.log(`  Deposit X: ${depositTokenXAmount.toString()} (${depositXDecimal})`);
+    console.log(`  Deposit Y: ${depositTokenYAmount.toString()} (${depositYDecimal})`);
+    console.log(`  Leftover X: ${leftoverTokenXAmount.toString()} (${leftoverXDecimal})`);
+    console.log(`  Leftover Y: ${leftoverTokenYAmount.toString()} (${leftoverYDecimal})`);
 
     // Build combined transaction
     const combinedTx = new Transaction();
 
-    // Get ATAs
+    // Get manager ATAs
     const managerTokenXAta = await getAssociatedTokenAddress(tokenXMint, manager);
     const managerTokenYAta = await getAssociatedTokenAddress(tokenYMint, manager);
-    const lpOwnerTokenXAta = await getAssociatedTokenAddress(tokenXMint, lpOwner.publicKey);
-    const lpOwnerTokenYAta = await getAssociatedTokenAddress(tokenYMint, lpOwner.publicKey);
 
     // Create LP owner ATAs if needed (always create both, even for native SOL which needs wrapped SOL ATA)
     // Manager pays for ATA creation as fee payer
@@ -1108,36 +1319,38 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
     );
 
     // Transfer tokens from manager to LP owner
-    if (!tokenXAmountBN.isZero()) {
-      if (isTokenXNativeSOL) {
-        // Transfer native SOL to wrapped SOL ATA and sync
-        combinedTx.add(
-          SystemProgram.transfer({
-            fromPubkey: manager,
-            toPubkey: lpOwnerTokenXAta,
-            lamports: Number(tokenXAmountBN.toString())
-          }),
-          createSyncNativeInstruction(lpOwnerTokenXAta)
-        );
-      } else {
-        combinedTx.add(
-          createTransferInstruction(
-            managerTokenXAta,
-            lpOwnerTokenXAta,
-            manager,
-            BigInt(tokenXAmountBN.toString())
-          )
-        );
+    // Skip if cleanup mode (tokens already in LP owner wallet)
+    if (!useCleanupMode) {
+      if (!tokenXAmountBN.isZero()) {
+        if (isTokenXNativeSOL) {
+          // Transfer native SOL to wrapped SOL ATA and sync
+          combinedTx.add(
+            SystemProgram.transfer({
+              fromPubkey: manager,
+              toPubkey: lpOwnerTokenXAta,
+              lamports: Number(tokenXAmountBN.toString())
+            }),
+            createSyncNativeInstruction(lpOwnerTokenXAta)
+          );
+        } else {
+          combinedTx.add(
+            createTransferInstruction(
+              managerTokenXAta,
+              lpOwnerTokenXAta,
+              manager,
+              BigInt(tokenXAmountBN.toString())
+            )
+          );
+        }
       }
-    }
 
-    if (!tokenYAmountBN.isZero()) {
-      if (isTokenYNativeSOL) {
-        // Transfer native SOL to wrapped SOL ATA and sync
-        combinedTx.add(
-          SystemProgram.transfer({
-            fromPubkey: manager,
-            toPubkey: lpOwnerTokenYAta,
+      if (!tokenYAmountBN.isZero()) {
+        if (isTokenYNativeSOL) {
+          // Transfer native SOL to wrapped SOL ATA and sync
+          combinedTx.add(
+            SystemProgram.transfer({
+              fromPubkey: manager,
+              toPubkey: lpOwnerTokenYAta,
             lamports: Number(tokenYAmountBN.toString())
           }),
           createSyncNativeInstruction(lpOwnerTokenYAta)
@@ -1152,14 +1365,16 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
           )
         );
       }
-    }
+      }
+    } // end if (!useCleanupMode)
 
     // Add liquidity to position using strategy
     // Using spot distribution around active bin
+    // Only deposit the BALANCED amounts, leaving excess in LP owner wallet
     const addLiquidityTx = await dlmmPool.addLiquidityByStrategy({
       positionPubKey: position.publicKey,
-      totalXAmount: tokenXAmountBN,
-      totalYAmount: tokenYAmountBN,
+      totalXAmount: depositTokenXAmount,
+      totalYAmount: depositTokenYAmount,
       strategy: {
         maxBinId: positionData.upperBinId,
         minBinId: positionData.lowerBinId,
@@ -1197,9 +1412,13 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
 
     console.log('✓ Deposit transaction built successfully');
     console.log(`  Pool: ${poolAddress.toBase58()}`);
-    console.log(`  Token X: ${tokenXAmountBN.toString()}`);
-    console.log(`  Token Y: ${tokenYAmountBN.toString()}`);
+    console.log(`  Transferred: ${tokenXAmountBN.toString()} X, ${tokenYAmountBN.toString()} Y`);
+    console.log(`  Deposited: ${depositTokenXAmount.toString()} X, ${depositTokenYAmount.toString()} Y`);
+    console.log(`  Leftover: ${leftoverTokenXAmount.toString()} X, ${leftoverTokenYAmount.toString()} Y`);
+    console.log(`  Active Bin Price: ${activeBinPrice}`);
     console.log(`  Request ID: ${requestId}`);
+
+    const hasLeftover = !leftoverTokenXAmount.isZero() || !leftoverTokenYAmount.isZero();
 
     // Store request data
     depositRequests.set(requestId, {
@@ -1208,10 +1427,17 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
       poolAddress: poolAddress.toBase58(),
       tokenXMint: tokenXMint.toBase58(),
       tokenYMint: tokenYMint.toBase58(),
+      tokenXDecimals: tokenXMintInfo.decimals,
+      tokenYDecimals: tokenYMintInfo.decimals,
       lpOwnerAddress: lpOwner.publicKey.toBase58(),
       managerAddress: manager.toBase58(),
-      tokenXAmount: tokenXAmountBN.toString(),
-      tokenYAmount: tokenYAmountBN.toString(),
+      transferredTokenXAmount: tokenXAmountBN.toString(),
+      transferredTokenYAmount: tokenYAmountBN.toString(),
+      depositedTokenXAmount: depositTokenXAmount.toString(),
+      depositedTokenYAmount: depositTokenYAmount.toString(),
+      leftoverTokenXAmount: leftoverTokenXAmount.toString(),
+      leftoverTokenYAmount: leftoverTokenYAmount.toString(),
+      activeBinPrice,
       positionAddress: position.publicKey.toBase58(),
       timestamp: Date.now()
     });
@@ -1228,11 +1454,24 @@ router.post('/deposit/build', dlmmLiquidityLimiter, async (req: Request, res: Re
       lpOwnerAddress: lpOwner.publicKey.toBase58(),
       managerAddress: manager.toBase58(),
       instructionsCount: combinedTx.instructions.length,
-      amounts: {
+      cleanupMode: useCleanupMode,
+      activeBinPrice,
+      hasLeftover,
+      transferred: {
         tokenX: tokenXAmountBN.toString(),
         tokenY: tokenYAmountBN.toString(),
       },
-      message: 'Sign this transaction with the manager wallet and submit to /dlmm/deposit/confirm'
+      deposited: {
+        tokenX: depositTokenXAmount.toString(),
+        tokenY: depositTokenYAmount.toString(),
+      },
+      leftover: {
+        tokenX: leftoverTokenXAmount.toString(),
+        tokenY: leftoverTokenYAmount.toString(),
+      },
+      message: hasLeftover
+        ? 'Sign this transaction with the manager wallet and submit to /dlmm/deposit/confirm. Note: leftover tokens will remain in LP owner wallet for cleanup.'
+        : 'Sign this transaction with the manager wallet and submit to /dlmm/deposit/confirm'
     });
 
   } catch (error) {
@@ -1419,8 +1658,9 @@ router.post('/deposit/confirm', dlmmLiquidityLimiter, async (req: Request, res: 
     console.log(`  Pool: ${requestData.poolAddress}`);
     console.log(`  Manager: ${requestData.managerAddress}`);
     console.log(`  LP Owner: ${requestData.lpOwnerAddress}`);
-    console.log(`  Token X: ${requestData.tokenXAmount}`);
-    console.log(`  Token Y: ${requestData.tokenYAmount}`);
+    console.log(`  Transferred: ${requestData.transferredTokenXAmount} X, ${requestData.transferredTokenYAmount} Y`);
+    console.log(`  Deposited: ${requestData.depositedTokenXAmount} X, ${requestData.depositedTokenYAmount} Y`);
+    console.log(`  Leftover: ${requestData.leftoverTokenXAmount} X, ${requestData.leftoverTokenYAmount} Y`);
     console.log(`  Solscan: https://solscan.io/tx/${signature}`);
 
     // Wait for confirmation
@@ -1438,23 +1678,541 @@ router.post('/deposit/confirm', dlmmLiquidityLimiter, async (req: Request, res: 
     // Clean up
     depositRequests.delete(requestId);
 
+    const hasLeftover = requestData.leftoverTokenXAmount !== '0' || requestData.leftoverTokenYAmount !== '0';
+
     res.json({
       success: true,
       signature,
       poolAddress: requestData.poolAddress,
       tokenXMint: requestData.tokenXMint,
       tokenYMint: requestData.tokenYMint,
-      amounts: {
-        tokenX: requestData.tokenXAmount,
-        tokenY: requestData.tokenYAmount,
+      tokenXDecimals: requestData.tokenXDecimals,
+      tokenYDecimals: requestData.tokenYDecimals,
+      activeBinPrice: requestData.activeBinPrice,
+      transferred: {
+        tokenX: requestData.transferredTokenXAmount,
+        tokenY: requestData.transferredTokenYAmount,
       },
-      message: 'Deposit transaction submitted successfully'
+      deposited: {
+        tokenX: requestData.depositedTokenXAmount,
+        tokenY: requestData.depositedTokenYAmount,
+      },
+      leftover: {
+        tokenX: requestData.leftoverTokenXAmount,
+        tokenY: requestData.leftoverTokenYAmount,
+      },
+      cleanupRequired: hasLeftover,
+      message: hasLeftover
+        ? 'Deposit transaction submitted successfully. Leftover tokens in LP wallet require cleanup.'
+        : 'Deposit transaction submitted successfully'
     });
 
   } catch (error) {
     console.error('DLMM deposit confirm error:', error);
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to confirm deposit'
+    });
+  } finally {
+    if (releaseLock) {
+      releaseLock();
+    }
+  }
+});
+
+// ============================================================================
+// POST /dlmm/cleanup/swap/build - Build swap transaction for leftover tokens
+// ============================================================================
+/**
+ * Cleanup swap endpoint - Step 1 of cleanup process
+ *
+ * This endpoint:
+ * 1. Reads LP owner's token balances
+ * 2. Determines which token is in excess based on pool price
+ * 3. Fetches Jupiter quote for swapping excess token
+ * 4. Returns unsigned swap transaction for manager to sign
+ */
+router.post('/cleanup/swap/build', dlmmLiquidityLimiter, async (req: Request, res: Response) => {
+  try {
+    const { poolAddress: poolAddressInput } = req.body;
+
+    console.log('DLMM cleanup swap build request received:', { poolAddress: poolAddressInput });
+
+    // Validate poolAddress
+    if (!poolAddressInput) {
+      return res.status(400).json({
+        error: 'Missing required field: poolAddress'
+      });
+    }
+
+    let poolAddress: PublicKey;
+    try {
+      poolAddress = new PublicKey(poolAddressInput);
+    } catch {
+      return res.status(400).json({
+        error: 'Invalid poolAddress: must be a valid Solana public key'
+      });
+    }
+
+    // Validate pool is whitelisted
+    if (!WHITELISTED_DLMM_POOLS.has(poolAddress.toBase58())) {
+      return res.status(403).json({
+        error: 'Pool not authorized for liquidity operations'
+      });
+    }
+
+    // Validate environment variables
+    const RPC_URL = process.env.RPC_URL;
+    const JUP_API_KEY = process.env.JUP_API_KEY;
+    if (!RPC_URL) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete. Missing RPC_URL.'
+      });
+    }
+
+    // Get pool-specific LP owner and manager wallet
+    let LP_OWNER_PRIVATE_KEY: string;
+    let MANAGER_WALLET: string;
+    try {
+      LP_OWNER_PRIVATE_KEY = getLpOwnerPrivateKeyForPool(poolAddress.toBase58());
+      MANAGER_WALLET = getManagerWalletForPool(poolAddress.toBase58());
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Initialize connection and keypairs
+    const connection = new Connection(RPC_URL, 'confirmed');
+    const lpOwner = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
+    const manager = new PublicKey(MANAGER_WALLET);
+
+    // SAFETY CHECK: Prevent cleanup swap for restricted LP owner address
+    if (lpOwner.publicKey.toBase58() === RESTRICTED_LP_OWNER) {
+      return res.status(403).json({
+        error: 'Cleanup swap operations are not permitted for this LP owner address'
+      });
+    }
+
+    // Create DLMM instance
+    console.log('Creating DLMM instance...');
+    const dlmmPool = await DLMM.create(connection, poolAddress);
+
+    const lbPair = dlmmPool.lbPair;
+    const tokenXMint = lbPair.tokenXMint;
+    const tokenYMint = lbPair.tokenYMint;
+
+    // Get token mint info
+    const tokenXMintInfo = await getMint(connection, tokenXMint);
+    const tokenYMintInfo = await getMint(connection, tokenYMint);
+    const isTokenYNativeSOL = tokenYMint.equals(NATIVE_MINT);
+
+    console.log(`  Token X Mint: ${tokenXMint.toBase58()} (decimals: ${tokenXMintInfo.decimals})`);
+    console.log(`  Token Y Mint: ${tokenYMint.toBase58()} (decimals: ${tokenYMintInfo.decimals})`);
+
+    // Get LP owner token balances
+    const lpOwnerTokenXAta = await getAssociatedTokenAddress(tokenXMint, lpOwner.publicKey);
+    const lpOwnerTokenYAta = await getAssociatedTokenAddress(tokenYMint, lpOwner.publicKey);
+
+    let tokenXBalance = new BN(0);
+    let tokenYBalance = new BN(0);
+
+    try {
+      const tokenXAccount = await connection.getTokenAccountBalance(lpOwnerTokenXAta);
+      tokenXBalance = new BN(tokenXAccount.value.amount);
+    } catch {
+      // Account doesn't exist or has 0 balance
+    }
+
+    try {
+      if (isTokenYNativeSOL) {
+        // For native SOL, check the account balance
+        const solBalance = await connection.getBalance(lpOwner.publicKey);
+        // Reserve some SOL for transaction fees (0.01 SOL)
+        const reserveForFees = 10_000_000; // 0.01 SOL in lamports
+        tokenYBalance = new BN(Math.max(0, solBalance - reserveForFees));
+      } else {
+        const tokenYAccount = await connection.getTokenAccountBalance(lpOwnerTokenYAta);
+        tokenYBalance = new BN(tokenYAccount.value.amount);
+      }
+    } catch {
+      // Account doesn't exist or has 0 balance
+    }
+
+    console.log(`  LP Owner X Balance: ${tokenXBalance.toString()}`);
+    console.log(`  LP Owner Y Balance: ${tokenYBalance.toString()}`);
+
+    // Check if there's anything to clean up
+    if (tokenXBalance.isZero() && tokenYBalance.isZero()) {
+      return res.status(400).json({
+        error: 'No leftover tokens to clean up',
+        balances: {
+          tokenX: '0',
+          tokenY: '0'
+        }
+      });
+    }
+
+    // Get user positions
+    const { userPositions, activeBin } = await dlmmPool.getPositionsByUserAndLbPair(lpOwner.publicKey);
+
+    if (userPositions.length === 0) {
+      return res.status(404).json({
+        error: 'No positions found for the LP owner in this pool.'
+      });
+    }
+
+    const position = userPositions[0];
+    const activeBinPrice = parseFloat(activeBin.pricePerToken);
+
+    console.log(`  Position: ${position.publicKey.toBase58()}`);
+    console.log(`  Active Bin Price: ${activeBinPrice}`);
+
+    // Determine which token is in excess and needs to be swapped
+    const tokenXDecimal = Number(tokenXBalance.toString()) / Math.pow(10, tokenXMintInfo.decimals);
+    const tokenYDecimal = Number(tokenYBalance.toString()) / Math.pow(10, tokenYMintInfo.decimals);
+
+    // Calculate what we'd need of each token for a balanced deposit
+    // At price P (Y per X): Y = X * P
+    const neededYForAllX = tokenXDecimal * activeBinPrice;
+    const neededXForAllY = tokenYDecimal / activeBinPrice;
+
+    let swapInputMint: PublicKey;
+    let swapOutputMint: PublicKey;
+    let swapInputAmount: BN;
+    let swapDirection: 'XtoY' | 'YtoX';
+
+    if (neededYForAllX > tokenYDecimal) {
+      // We have excess X, need to swap some X for Y
+      // Swap HALF the excess - heuristic to account for price impact moving toward our ratio
+      const excessXDecimal = tokenXDecimal - neededXForAllY;
+      const swapXDecimal = excessXDecimal / 2;
+      swapInputAmount = new BN(Math.floor(swapXDecimal * Math.pow(10, tokenXMintInfo.decimals)));
+      swapInputMint = tokenXMint;
+      swapOutputMint = tokenYMint;
+      swapDirection = 'XtoY';
+      console.log(`  Swap direction: X → Y (excess: ${excessXDecimal}, swapping half: ${swapXDecimal} X)`);
+    } else {
+      // We have excess Y, need to swap some Y for X
+      // Swap HALF the excess - heuristic to account for price impact moving toward our ratio
+      const excessYDecimal = tokenYDecimal - neededYForAllX;
+      const swapYDecimal = excessYDecimal / 2;
+      swapInputAmount = new BN(Math.floor(swapYDecimal * Math.pow(10, tokenYMintInfo.decimals)));
+      swapInputMint = tokenYMint;
+      swapOutputMint = tokenXMint;
+      swapDirection = 'YtoX';
+      console.log(`  Swap direction: Y → X (excess: ${excessYDecimal}, swapping half: ${swapYDecimal} Y)`);
+    }
+
+    if (swapInputAmount.isZero()) {
+      return res.status(400).json({
+        error: 'Leftover amounts are too small to warrant cleanup',
+        balances: {
+          tokenX: tokenXBalance.toString(),
+          tokenY: tokenYBalance.toString()
+        }
+      });
+    }
+
+    // Fetch Jupiter quote
+    console.log('  Fetching Jupiter quote...');
+    const jupiterHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (JUP_API_KEY) {
+      jupiterHeaders['x-api-key'] = JUP_API_KEY;
+    }
+
+    const quoteResponse = await fetch(
+      `https://quote-api.jup.ag/v6/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100`,
+      { headers: jupiterHeaders }
+    );
+
+    if (!quoteResponse.ok) {
+      return res.status(500).json({
+        error: 'Failed to fetch Jupiter quote',
+        details: await quoteResponse.text()
+      });
+    }
+
+    const quoteData = await quoteResponse.json();
+    const expectedOutputAmount = quoteData.outAmount;
+
+    console.log(`  Jupiter quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
+
+    // Fetch Jupiter swap transaction
+    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+      method: 'POST',
+      headers: jupiterHeaders,
+      body: JSON.stringify({
+        quoteResponse: quoteData,
+        userPublicKey: lpOwner.publicKey.toBase58(),
+        wrapAndUnwrapSol: true,
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: 'auto'
+      })
+    });
+
+    if (!swapResponse.ok) {
+      return res.status(500).json({
+        error: 'Failed to fetch Jupiter swap transaction',
+        details: await swapResponse.text()
+      });
+    }
+
+    const swapData = await swapResponse.json();
+    const swapTransactionBase64 = swapData.swapTransaction;
+
+    // Decode the swap transaction
+    const swapTransactionBuffer = Buffer.from(swapTransactionBase64, 'base64');
+    const swapTransaction = Transaction.from(swapTransactionBuffer);
+
+    // Set transaction properties
+    const { blockhash } = await connection.getLatestBlockhash();
+
+    // Update swap transaction with manager as fee payer
+    swapTransaction.recentBlockhash = blockhash;
+    swapTransaction.feePayer = manager;
+
+    // Serialize transaction
+    const unsignedSwapTx = bs58.encode(swapTransaction.serialize({ requireAllSignatures: false }));
+    const swapTxHash = crypto.createHash('sha256').update(swapTransaction.serializeMessage()).digest('hex');
+
+    // Generate request ID
+    const requestId = crypto.randomBytes(16).toString('hex');
+
+    console.log('✓ Cleanup swap transaction built successfully');
+    console.log(`  Pool: ${poolAddress.toBase58()}`);
+    console.log(`  Swap: ${swapInputAmount.toString()} ${swapDirection === 'XtoY' ? 'X→Y' : 'Y→X'}`);
+    console.log(`  Expected output: ${expectedOutputAmount}`);
+    console.log(`  Request ID: ${requestId}`);
+
+    // Store request data
+    cleanupSwapRequests.set(requestId, {
+      unsignedTransaction: unsignedSwapTx,
+      unsignedTransactionHash: swapTxHash,
+      poolAddress: poolAddress.toBase58(),
+      tokenXMint: tokenXMint.toBase58(),
+      tokenYMint: tokenYMint.toBase58(),
+      tokenXDecimals: tokenXMintInfo.decimals,
+      tokenYDecimals: tokenYMintInfo.decimals,
+      lpOwnerAddress: lpOwner.publicKey.toBase58(),
+      managerAddress: manager.toBase58(),
+      activeBinPrice,
+      swapInputMint: swapInputMint.toBase58(),
+      swapInputAmount: swapInputAmount.toString(),
+      swapOutputMint: swapOutputMint.toBase58(),
+      swapExpectedOutputAmount: expectedOutputAmount,
+      swapDirection,
+      timestamp: Date.now()
+    });
+
+    return res.json({
+      success: true,
+      transaction: unsignedSwapTx,
+      requestId,
+      poolAddress: poolAddress.toBase58(),
+      tokenXMint: tokenXMint.toBase58(),
+      tokenYMint: tokenYMint.toBase58(),
+      tokenXDecimals: tokenXMintInfo.decimals,
+      tokenYDecimals: tokenYMintInfo.decimals,
+      lpOwnerAddress: lpOwner.publicKey.toBase58(),
+      managerAddress: manager.toBase58(),
+      activeBinPrice,
+      balances: {
+        tokenX: tokenXBalance.toString(),
+        tokenY: tokenYBalance.toString(),
+      },
+      swap: {
+        inputMint: swapInputMint.toBase58(),
+        inputAmount: swapInputAmount.toString(),
+        outputMint: swapOutputMint.toBase58(),
+        expectedOutputAmount,
+        direction: swapDirection
+      },
+      message: 'Sign this transaction with the manager wallet and submit to /dlmm/cleanup/swap/confirm. After swap completes, call /dlmm/deposit/build with tokenXAmount=0 and tokenYAmount=0 to deposit LP owner wallet balances.'
+    });
+
+  } catch (error) {
+    console.error('Error building DLMM cleanup swap transaction:', error);
+    return res.status(500).json({
+      error: 'Failed to build cleanup swap transaction',
+      details: error instanceof Error ? error.message : String(error)
+    });
+  }
+});
+
+// ============================================================================
+// POST /dlmm/cleanup/swap/confirm - Confirm and submit swap transaction
+// ============================================================================
+/**
+ * Cleanup swap confirm - Step 2 of cleanup process
+ *
+ * Security measures:
+ * 1. Manager wallet signature verification
+ * 2. Lock system - Prevents concurrent operations
+ * 3. Request expiry - 10 minute timeout
+ * 4. Transaction hash validation - Prevents tampering
+ */
+router.post('/cleanup/swap/confirm', dlmmLiquidityLimiter, async (req: Request, res: Response) => {
+  let releaseLock: (() => void) | null = null;
+
+  try {
+    const { signedTransaction, requestId } = req.body;
+
+    console.log('DLMM cleanup swap confirm request received:', { requestId });
+
+    // Validate required fields
+    if (!signedTransaction || !requestId) {
+      return res.status(400).json({
+        error: 'Missing required fields: signedTransaction and requestId'
+      });
+    }
+
+    // Retrieve request data
+    const requestData = cleanupSwapRequests.get(requestId);
+    if (!requestData) {
+      return res.status(400).json({
+        error: 'Cleanup swap request not found or expired. Please call /dlmm/cleanup/swap/build first.'
+      });
+    }
+
+    console.log('  Pool:', requestData.poolAddress);
+    console.log('  Manager:', requestData.managerAddress);
+    console.log('  LP Owner:', requestData.lpOwnerAddress);
+
+    // Acquire lock
+    releaseLock = await acquireLiquidityLock(requestData.poolAddress);
+    console.log('  Lock acquired');
+
+    // Check request age
+    const TEN_MINUTES = 10 * 60 * 1000;
+    if (Date.now() - requestData.timestamp > TEN_MINUTES) {
+      cleanupSwapRequests.delete(requestId);
+      return res.status(400).json({
+        error: 'Cleanup swap request expired. Please create a new request.'
+      });
+    }
+
+    // Validate environment variables
+    const RPC_URL = process.env.RPC_URL;
+    let LP_OWNER_PRIVATE_KEY: string;
+
+    try {
+      LP_OWNER_PRIVATE_KEY = getLpOwnerPrivateKeyForPool(requestData.poolAddress);
+    } catch (error) {
+      return res.status(500).json({
+        error: 'Server configuration incomplete',
+        details: error instanceof Error ? error.message : String(error)
+      });
+    }
+
+    // Initialize connection
+    const connection = new Connection(RPC_URL!, 'confirmed');
+    const lpOwnerKeypair = Keypair.fromSecretKey(bs58.decode(LP_OWNER_PRIVATE_KEY));
+    const managerWalletPubKey = new PublicKey(requestData.managerAddress);
+
+    // Deserialize transaction
+    let transaction: Transaction;
+    try {
+      const transactionBuffer = bs58.decode(signedTransaction);
+      transaction = Transaction.from(transactionBuffer);
+    } catch (error) {
+      return res.status(400).json({
+        error: `Failed to deserialize transaction: ${error instanceof Error ? error.message : 'Unknown error'}`
+      });
+    }
+
+    // SECURITY: Verify manager wallet has signed
+    const managerSignature = transaction.signatures.find(sig =>
+      sig.publicKey.equals(managerWalletPubKey)
+    );
+
+    if (!managerSignature || !managerSignature.signature) {
+      return res.status(400).json({
+        error: 'Transaction verification failed: Manager wallet has not signed'
+      });
+    }
+
+    // Verify manager signature is valid
+    const messageData = transaction.serializeMessage();
+    const managerSigValid = nacl.sign.detached.verify(
+      messageData,
+      managerSignature.signature,
+      managerSignature.publicKey.toBytes()
+    );
+
+    if (!managerSigValid) {
+      return res.status(400).json({
+        error: 'Transaction verification failed: Invalid manager wallet signature'
+      });
+    }
+
+    // SECURITY: Verify transaction hasn't been tampered with
+    const receivedTransactionHash = crypto.createHash('sha256')
+      .update(transaction.serializeMessage())
+      .digest('hex');
+
+    if (receivedTransactionHash !== requestData.unsignedTransactionHash) {
+      console.log('  ⚠️  Transaction hash mismatch detected');
+      return res.status(400).json({
+        error: 'Transaction verification failed: transaction has been modified'
+      });
+    }
+    console.log('  ✓ Transaction integrity verified');
+
+    // Add LP owner signature
+    transaction.partialSign(lpOwnerKeypair);
+
+    // Send transaction
+    console.log('  Sending swap transaction...');
+    const signature = await connection.sendRawTransaction(transaction.serialize(), {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed'
+    });
+
+    console.log(`  ✓ Swap transaction sent: ${signature}`);
+
+    // Wait for confirmation
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+    try {
+      await connection.confirmTransaction({
+        signature,
+        blockhash,
+        lastValidBlockHeight
+      });
+      console.log(`  ✓ Swap confirmed: ${signature}`);
+    } catch (error) {
+      console.error(`  ⚠ Swap confirmation timeout for ${signature}:`, error);
+    }
+
+    console.log('✓ DLMM cleanup swap completed');
+    console.log(`  Signature: ${signature}`);
+    console.log(`  Pool: ${requestData.poolAddress}`);
+
+    // Clean up
+    cleanupSwapRequests.delete(requestId);
+
+    res.json({
+      success: true,
+      signature,
+      poolAddress: requestData.poolAddress,
+      tokenXMint: requestData.tokenXMint,
+      tokenYMint: requestData.tokenYMint,
+      swap: {
+        inputMint: requestData.swapInputMint,
+        inputAmount: requestData.swapInputAmount,
+        outputMint: requestData.swapOutputMint,
+        expectedOutputAmount: requestData.swapExpectedOutputAmount,
+        direction: requestData.swapDirection
+      },
+      message: 'Swap transaction submitted successfully. Call /dlmm/deposit/build with tokenXAmount=0 and tokenYAmount=0 to deposit LP owner wallet balances.'
+    });
+
+  } catch (error) {
+    console.error('DLMM cleanup swap confirm error:', error);
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to confirm cleanup swap'
     });
   } finally {
     if (releaseLock) {
