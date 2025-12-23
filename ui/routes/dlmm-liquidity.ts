@@ -61,8 +61,17 @@ interface DlmmWithdrawData {
   lpOwnerAddress: string;
   managerAddress: string;
   destinationAddress: string;
-  estimatedTokenXAmount: string;
-  estimatedTokenYAmount: string;
+  // Amounts withdrawn from DLMM bins
+  withdrawnTokenXAmount: string;
+  withdrawnTokenYAmount: string;
+  // Amounts transferred to manager (at market price ratio)
+  transferTokenXAmount: string;
+  transferTokenYAmount: string;
+  // Amounts redeposited back to DLMM
+  redepositTokenXAmount: string;
+  redepositTokenYAmount: string;
+  // Market price info
+  marketPrice: number; // tokenY per tokenX (e.g., SOL per ZC)
   positionAddress: string;
   fromBinId: number;
   toBinId: number;
@@ -178,6 +187,72 @@ setInterval(() => {
     }
   }
 }, 5 * 60 * 1000);
+
+// ============================================================================
+// Jupiter Price API Helper
+// ============================================================================
+
+interface JupiterPriceResponse {
+  [mint: string]: {
+    usdPrice: number;
+    blockId: number;
+    decimals: number;
+    priceChange24h?: number;
+  };
+}
+
+/**
+ * Fetch token prices from Jupiter Price API V3
+ * Returns price of tokenX in terms of tokenY (e.g., SOL per ZC)
+ */
+async function getJupiterPrice(tokenXMint: string, tokenYMint: string): Promise<{
+  tokenXUsdPrice: number;
+  tokenYUsdPrice: number;
+  tokenYPerTokenX: number; // How many tokenY per 1 tokenX (e.g., SOL per ZC)
+}> {
+  const JUPITER_API_KEY = process.env.JUP_API_KEY;
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  if (JUPITER_API_KEY) {
+    headers['x-api-key'] = JUPITER_API_KEY;
+  }
+
+  const response = await fetch(
+    `https://api.jup.ag/price/v3?ids=${tokenXMint},${tokenYMint}`,
+    { headers }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Jupiter API error: ${response.status} ${response.statusText}`);
+  }
+
+  const data = await response.json() as JupiterPriceResponse;
+
+  const tokenXData = data[tokenXMint];
+  const tokenYData = data[tokenYMint];
+
+  if (!tokenXData || !tokenXData.usdPrice) {
+    throw new Error(`Jupiter API: No price data for token X (${tokenXMint})`);
+  }
+
+  if (!tokenYData || !tokenYData.usdPrice) {
+    throw new Error(`Jupiter API: No price data for token Y (${tokenYMint})`);
+  }
+
+  // tokenYPerTokenX = how many tokenY you get for 1 tokenX
+  // e.g., if ZC = $0.001 and SOL = $100, then tokenYPerTokenX = 0.001 / 100 = 0.00001 SOL per ZC
+  const tokenYPerTokenX = tokenXData.usdPrice / tokenYData.usdPrice;
+
+  console.log(`  Jupiter prices: tokenX=$${tokenXData.usdPrice}, tokenY=$${tokenYData.usdPrice}`);
+  console.log(`  Market rate: 1 tokenX = ${tokenYPerTokenX} tokenY`);
+
+  return {
+    tokenXUsdPrice: tokenXData.usdPrice,
+    tokenYUsdPrice: tokenYData.usdPrice,
+    tokenYPerTokenX,
+  };
+}
 
 // ============================================================================
 // POST /dlmm/withdraw/build - Build withdrawal transaction
@@ -330,7 +405,143 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
     const managerTokenXAta = await getAssociatedTokenAddress(tokenXMint, managerWallet);
     const managerTokenYAta = await getAssociatedTokenAddress(tokenYMint, managerWallet);
 
-    // Build transfer transaction (separate from liquidity removal)
+    // =========================================================================
+    // Fetch Jupiter market price and calculate correct amounts
+    // =========================================================================
+    console.log('  Fetching Jupiter market price...');
+    const jupiterPrice = await getJupiterPrice(
+      tokenXMint.toBase58(),
+      tokenYMint.toBase58()
+    );
+
+    // Convert withdrawn amounts to decimal for price calculations
+    const withdrawnXDecimal = Number(estimatedTokenXAmount.toString()) / Math.pow(10, tokenXMintInfo.decimals);
+    const withdrawnYDecimal = Number(estimatedTokenYAmount.toString()) / Math.pow(10, tokenYMintInfo.decimals);
+
+    // Market price: tokenY per tokenX (e.g., SOL per ZC)
+    const marketPrice = jupiterPrice.tokenYPerTokenX;
+
+    console.log(`  Withdrawn: ${withdrawnXDecimal} tokenX, ${withdrawnYDecimal} tokenY`);
+    console.log(`  Market price: ${marketPrice} tokenY per tokenX`);
+
+    // Calculate what amounts we need at market price
+    // Option A: Use all tokenX, calculate needed tokenY
+    const neededYForAllX = withdrawnXDecimal * marketPrice;
+    // Option B: Use all tokenY, calculate needed tokenX
+    const neededXForAllY = withdrawnYDecimal / marketPrice;
+
+    let transferXDecimal: number;
+    let transferYDecimal: number;
+    let redepositXDecimal: number;
+    let redepositYDecimal: number;
+
+    if (neededYForAllX <= withdrawnYDecimal) {
+      // We have excess tokenY (SOL) - use all tokenX, redeposit excess tokenY
+      transferXDecimal = withdrawnXDecimal;
+      transferYDecimal = neededYForAllX;
+      redepositXDecimal = 0;
+      redepositYDecimal = withdrawnYDecimal - neededYForAllX;
+      console.log(`  Case: Excess tokenY - redepositing ${redepositYDecimal} tokenY`);
+    } else {
+      // We have excess tokenX (ZC) - use all tokenY, redeposit excess tokenX
+      transferXDecimal = neededXForAllY;
+      transferYDecimal = withdrawnYDecimal;
+      redepositXDecimal = withdrawnXDecimal - neededXForAllY;
+      redepositYDecimal = 0;
+      console.log(`  Case: Excess tokenX - redepositing ${redepositXDecimal} tokenX`);
+    }
+
+    // Convert back to raw amounts (BN)
+    const transferTokenXAmount = new BN(Math.floor(transferXDecimal * Math.pow(10, tokenXMintInfo.decimals)));
+    const transferTokenYAmount = new BN(Math.floor(transferYDecimal * Math.pow(10, tokenYMintInfo.decimals)));
+    const redepositTokenXAmount = new BN(Math.floor(redepositXDecimal * Math.pow(10, tokenXMintInfo.decimals)));
+    const redepositTokenYAmount = new BN(Math.floor(redepositYDecimal * Math.pow(10, tokenYMintInfo.decimals)));
+
+    console.log(`  Transfer to manager: ${transferTokenXAmount.toString()} tokenX, ${transferTokenYAmount.toString()} tokenY`);
+    console.log(`  Redeposit to DLMM: ${redepositTokenXAmount.toString()} tokenX, ${redepositTokenYAmount.toString()} tokenY`);
+
+    // =========================================================================
+    // Build redeposit transaction (if needed)
+    // =========================================================================
+    let redepositTx: Transaction | null = null;
+    const hasRedeposit = !redepositTokenXAmount.isZero() || !redepositTokenYAmount.isZero();
+
+    if (hasRedeposit) {
+      console.log('  Building redeposit transaction...');
+
+      redepositTx = new Transaction();
+
+      // If redepositing native SOL, we need to wrap it first
+      // After withdrawal with skipUnwrapSOL: false, SOL is in native balance
+      // addLiquidityByStrategy expects wSOL in ATA
+      if (isTokenXNativeSOL && !redepositTokenXAmount.isZero()) {
+        // Ensure wSOL ATA exists
+        redepositTx.add(
+          createAssociatedTokenAccountIdempotentInstruction(
+            lpOwner.publicKey,
+            lpOwnerTokenXAta,
+            lpOwner.publicKey,
+            NATIVE_MINT
+          )
+        );
+        // Transfer native SOL to wSOL ATA and sync
+        redepositTx.add(
+          SystemProgram.transfer({
+            fromPubkey: lpOwner.publicKey,
+            toPubkey: lpOwnerTokenXAta,
+            lamports: Number(redepositTokenXAmount.toString())
+          }),
+          createSyncNativeInstruction(lpOwnerTokenXAta)
+        );
+      }
+
+      if (isTokenYNativeSOL && !redepositTokenYAmount.isZero()) {
+        // Ensure wSOL ATA exists
+        redepositTx.add(
+          createAssociatedTokenAccountIdempotentInstruction(
+            lpOwner.publicKey,
+            lpOwnerTokenYAta,
+            lpOwner.publicKey,
+            NATIVE_MINT
+          )
+        );
+        // Transfer native SOL to wSOL ATA and sync
+        redepositTx.add(
+          SystemProgram.transfer({
+            fromPubkey: lpOwner.publicKey,
+            toPubkey: lpOwnerTokenYAta,
+            lamports: Number(redepositTokenYAmount.toString())
+          }),
+          createSyncNativeInstruction(lpOwnerTokenYAta)
+        );
+      }
+
+      // Build add liquidity transaction for the excess tokens
+      const addLiquidityTx = await dlmmPool.addLiquidityByStrategy({
+        positionPubKey: position.publicKey,
+        totalXAmount: redepositTokenXAmount,
+        totalYAmount: redepositTokenYAmount,
+        strategy: {
+          maxBinId: positionData.upperBinId,
+          minBinId: positionData.lowerBinId,
+          strategyType: 0, // Spot strategy
+        },
+        user: lpOwner.publicKey,
+        slippage: 100, // 1% slippage
+      });
+
+      if (Array.isArray(addLiquidityTx)) {
+        for (const tx of addLiquidityTx) {
+          redepositTx.add(...tx.instructions);
+        }
+      } else {
+        redepositTx.add(...addLiquidityTx.instructions);
+      }
+    }
+
+    // =========================================================================
+    // Build transfer transaction (only needed amounts to manager)
+    // =========================================================================
     const transferTx = new Transaction();
 
     // Create manager ATAs if needed
@@ -354,14 +565,14 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
       );
     }
 
-    // Transfer Token X to manager
-    if (!estimatedTokenXAmount.isZero()) {
+    // Transfer Token X to manager (only the needed amount)
+    if (!transferTokenXAmount.isZero()) {
       if (isTokenXNativeSOL) {
         transferTx.add(
           SystemProgram.transfer({
             fromPubkey: lpOwner.publicKey,
             toPubkey: managerWallet,
-            lamports: Number(estimatedTokenXAmount.toString())
+            lamports: Number(transferTokenXAmount.toString())
           })
         );
       } else {
@@ -370,20 +581,20 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
             lpOwnerTokenXAta,
             managerTokenXAta,
             lpOwner.publicKey,
-            BigInt(estimatedTokenXAmount.toString())
+            BigInt(transferTokenXAmount.toString())
           )
         );
       }
     }
 
-    // Transfer Token Y to manager
-    if (!estimatedTokenYAmount.isZero()) {
+    // Transfer Token Y to manager (only the needed amount)
+    if (!transferTokenYAmount.isZero()) {
       if (isTokenYNativeSOL) {
         transferTx.add(
           SystemProgram.transfer({
             fromPubkey: lpOwner.publicKey,
             toPubkey: managerWallet,
-            lamports: Number(estimatedTokenYAmount.toString())
+            lamports: Number(transferTokenYAmount.toString())
           })
         );
       } else {
@@ -392,13 +603,16 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
             lpOwnerTokenYAta,
             managerTokenYAta,
             lpOwner.publicKey,
-            BigInt(estimatedTokenYAmount.toString())
+            BigInt(transferTokenYAmount.toString())
           )
         );
       }
     }
 
-    // Prepare all transactions (SDK removal txs + transfer tx)
+    // =========================================================================
+    // Prepare all transactions
+    // Order: 1) Remove liquidity, 2) Redeposit excess, 3) Transfer to manager
+    // =========================================================================
     const { blockhash } = await connection.getLatestBlockhash();
     const allTransactions: Transaction[] = [];
 
@@ -409,6 +623,13 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
       removeTx.recentBlockhash = blockhash;
       removeTx.feePayer = managerWallet;
       allTransactions.push(removeTx);
+    }
+
+    // Add redeposit transaction if needed
+    if (redepositTx) {
+      redepositTx.recentBlockhash = blockhash;
+      redepositTx.feePayer = managerWallet;
+      allTransactions.push(redepositTx);
     }
 
     // Add the transfer transaction as the final tx
@@ -434,8 +655,10 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
     console.log('✓ Withdrawal transactions built successfully');
     console.log(`  Pool: ${poolAddress.toBase58()}`);
     console.log(`  Withdrawal: ${withdrawalPercentage}%`);
-    console.log(`  Token X: ${estimatedTokenXAmount.toString()}`);
-    console.log(`  Token Y: ${estimatedTokenYAmount.toString()}`);
+    console.log(`  Withdrawn: ${estimatedTokenXAmount.toString()} tokenX, ${estimatedTokenYAmount.toString()} tokenY`);
+    console.log(`  Transfer: ${transferTokenXAmount.toString()} tokenX, ${transferTokenYAmount.toString()} tokenY`);
+    console.log(`  Redeposit: ${redepositTokenXAmount.toString()} tokenX, ${redepositTokenYAmount.toString()} tokenY`);
+    console.log(`  Market price: ${marketPrice} tokenY/tokenX`);
     console.log(`  Request ID: ${requestId}`);
     console.log(`  Transaction count: ${allTransactions.length}`);
 
@@ -449,8 +672,13 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
       lpOwnerAddress: lpOwner.publicKey.toBase58(),
       managerAddress: managerWallet.toBase58(),
       destinationAddress: managerWallet.toBase58(),
-      estimatedTokenXAmount: estimatedTokenXAmount.toString(),
-      estimatedTokenYAmount: estimatedTokenYAmount.toString(),
+      withdrawnTokenXAmount: estimatedTokenXAmount.toString(),
+      withdrawnTokenYAmount: estimatedTokenYAmount.toString(),
+      transferTokenXAmount: transferTokenXAmount.toString(),
+      transferTokenYAmount: transferTokenYAmount.toString(),
+      redepositTokenXAmount: redepositTokenXAmount.toString(),
+      redepositTokenYAmount: redepositTokenYAmount.toString(),
+      marketPrice,
       positionAddress: position.publicKey.toBase58(),
       fromBinId: positionData.lowerBinId,
       toBinId: positionData.upperBinId,
@@ -471,9 +699,18 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
       lpOwnerAddress: lpOwner.publicKey.toBase58(),
       destinationAddress: managerWallet.toBase58(),
       withdrawalPercentage,
-      estimatedAmounts: {
+      marketPrice,
+      withdrawn: {
         tokenX: estimatedTokenXAmount.toString(),
         tokenY: estimatedTokenYAmount.toString(),
+      },
+      transferred: {
+        tokenX: transferTokenXAmount.toString(),
+        tokenY: transferTokenYAmount.toString(),
+      },
+      redeposited: {
+        tokenX: redepositTokenXAmount.toString(),
+        tokenY: redepositTokenYAmount.toString(),
       },
       message: 'Sign all transactions with the manager wallet and submit to /dlmm/withdraw/confirm'
     });
@@ -711,9 +948,18 @@ router.post('/withdraw/confirm', dlmmLiquidityLimiter, async (req: Request, res:
       tokenXMint: requestData.tokenXMint,
       tokenYMint: requestData.tokenYMint,
       withdrawalPercentage: requestData.withdrawalPercentage,
-      estimatedAmounts: {
-        tokenX: requestData.estimatedTokenXAmount,
-        tokenY: requestData.estimatedTokenYAmount,
+      marketPrice: requestData.marketPrice,
+      withdrawn: {
+        tokenX: requestData.withdrawnTokenXAmount,
+        tokenY: requestData.withdrawnTokenYAmount,
+      },
+      transferred: {
+        tokenX: requestData.transferTokenXAmount,
+        tokenY: requestData.transferTokenYAmount,
+      },
+      redeposited: {
+        tokenX: requestData.redepositTokenXAmount,
+        tokenY: requestData.redepositTokenYAmount,
       },
       message: 'Withdrawal transactions submitted successfully'
     });

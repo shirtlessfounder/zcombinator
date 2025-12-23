@@ -46,7 +46,16 @@ interface WithdrawBuildResponse {
   lpOwnerAddress: string;
   destinationAddress: string;
   withdrawalPercentage: number;
-  estimatedAmounts: {
+  marketPrice: number;
+  withdrawn: {
+    tokenX: string;
+    tokenY: string;
+  };
+  transferred: {
+    tokenX: string;
+    tokenY: string;
+  };
+  redeposited: {
     tokenX: string;
     tokenY: string;
   };
@@ -60,7 +69,16 @@ interface WithdrawConfirmResponse {
   tokenXMint: string;
   tokenYMint: string;
   withdrawalPercentage: number;
-  estimatedAmounts: {
+  marketPrice: number;
+  withdrawn: {
+    tokenX: string;
+    tokenY: string;
+  };
+  transferred: {
+    tokenX: string;
+    tokenY: string;
+  };
+  redeposited: {
     tokenX: string;
     tokenY: string;
   };
@@ -196,8 +214,10 @@ async function testDlmmApi() {
     console.log(`     Token X Mint: ${withdrawBuildResponse.tokenXMint}`);
     console.log(`     Token Y Mint: ${withdrawBuildResponse.tokenYMint}`);
     console.log(`     Transaction Count: ${withdrawBuildResponse.transactionCount}`);
-    console.log(`     Estimated X Amount: ${withdrawBuildResponse.estimatedAmounts.tokenX}`);
-    console.log(`     Estimated Y Amount: ${withdrawBuildResponse.estimatedAmounts.tokenY}`);
+    console.log(`     Market Price: ${withdrawBuildResponse.marketPrice} tokenY/tokenX`);
+    console.log(`     Withdrawn: ${withdrawBuildResponse.withdrawn.tokenX} X, ${withdrawBuildResponse.withdrawn.tokenY} Y`);
+    console.log(`     Transferred: ${withdrawBuildResponse.transferred.tokenX} X, ${withdrawBuildResponse.transferred.tokenY} Y`);
+    console.log(`     Redeposited: ${withdrawBuildResponse.redeposited.tokenX} X, ${withdrawBuildResponse.redeposited.tokenY} Y`);
     console.log('');
 
     // Step 1b: Sign all transactions
@@ -225,8 +245,10 @@ async function testDlmmApi() {
     for (const sig of withdrawConfirmResponse.signatures) {
       console.log(`       - https://solscan.io/tx/${sig}`);
     }
-    console.log(`     Token X Withdrawn: ${withdrawConfirmResponse.estimatedAmounts.tokenX}`);
-    console.log(`     Token Y Withdrawn: ${withdrawConfirmResponse.estimatedAmounts.tokenY}`);
+    console.log(`     Market Price: ${withdrawConfirmResponse.marketPrice} tokenY/tokenX`);
+    console.log(`     Withdrawn: ${withdrawConfirmResponse.withdrawn.tokenX} X, ${withdrawConfirmResponse.withdrawn.tokenY} Y`);
+    console.log(`     Transferred: ${withdrawConfirmResponse.transferred.tokenX} X, ${withdrawConfirmResponse.transferred.tokenY} Y`);
+    console.log(`     Redeposited: ${withdrawConfirmResponse.redeposited.tokenX} X, ${withdrawConfirmResponse.redeposited.tokenY} Y`);
     console.log('');
 
     // Wait a moment between operations
@@ -241,14 +263,15 @@ async function testDlmmApi() {
     console.log('📥 TESTING DEPOSIT FLOW');
     console.log('═══════════════════════════════════════════════════════════════\n');
 
-    // Use the withdrawn amounts for deposit, but only 80% of SOL to test ratio mismatch
-    const depositXAmount = withdrawConfirmResponse.estimatedAmounts.tokenX; // 100% of Token X (ZC)
-    const depositYAmountFull = BigInt(withdrawConfirmResponse.estimatedAmounts.tokenY);
+    // Use the transferred amounts for deposit (what the manager actually received)
+    // Only deposit 80% of SOL to test ratio mismatch
+    const depositXAmount = withdrawConfirmResponse.transferred.tokenX; // 100% of Token X (ZC)
+    const depositYAmountFull = BigInt(withdrawConfirmResponse.transferred.tokenY);
     const depositYAmount = ((depositYAmountFull * BigInt(DEPOSIT_SOL_PERCENTAGE)) / BigInt(100)).toString(); // 80% of Token Y (SOL)
 
-    console.log(`  Withdrawn amounts:`);
-    console.log(`     Token X (ZC): ${withdrawConfirmResponse.estimatedAmounts.tokenX}`);
-    console.log(`     Token Y (SOL): ${withdrawConfirmResponse.estimatedAmounts.tokenY}`);
+    console.log(`  Transferred amounts (what manager received):`);
+    console.log(`     Token X (ZC): ${withdrawConfirmResponse.transferred.tokenX}`);
+    console.log(`     Token Y (SOL): ${withdrawConfirmResponse.transferred.tokenY}`);
     console.log('');
     console.log(`  Depositing back (testing ratio mismatch):`);
     console.log(`     Token X (ZC): ${depositXAmount} (100%)`);
@@ -314,15 +337,24 @@ async function testDlmmApi() {
 
     console.log('📊 Summary:');
     console.log(`  Pool: ${DLMM_POOL_ADDRESS}`);
+    console.log(`  Market Price: ${withdrawConfirmResponse.marketPrice} tokenY/tokenX`);
     console.log(`  Withdrawal TXs: ${withdrawConfirmResponse.signatures.length}`);
     for (const sig of withdrawConfirmResponse.signatures) {
       console.log(`    - ${sig}`);
     }
     console.log(`  Deposit TX: ${depositConfirmResponse.signature}`);
     console.log('');
-    console.log('  💧 Withdrawal:');
-    console.log(`     Token X: ${withdrawConfirmResponse.estimatedAmounts.tokenX}`);
-    console.log(`     Token Y: ${withdrawConfirmResponse.estimatedAmounts.tokenY}`);
+    console.log('  💧 Withdrawal (from DLMM):');
+    console.log(`     Token X: ${withdrawConfirmResponse.withdrawn.tokenX}`);
+    console.log(`     Token Y: ${withdrawConfirmResponse.withdrawn.tokenY}`);
+    console.log('');
+    console.log('  📤 Transferred (to manager):');
+    console.log(`     Token X: ${withdrawConfirmResponse.transferred.tokenX}`);
+    console.log(`     Token Y: ${withdrawConfirmResponse.transferred.tokenY}`);
+    console.log('');
+    console.log('  🔄 Redeposited (back to DLMM):');
+    console.log(`     Token X: ${withdrawConfirmResponse.redeposited.tokenX}`);
+    console.log(`     Token Y: ${withdrawConfirmResponse.redeposited.tokenY}`);
     console.log('');
     console.log('  💧 Deposit:');
     console.log(`     Token X: ${depositConfirmResponse.amounts.tokenX}`);
