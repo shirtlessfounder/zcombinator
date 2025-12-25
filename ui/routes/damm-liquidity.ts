@@ -1749,7 +1749,7 @@ router.post('/cleanup/swap/build', dammLiquidityLimiter, async (req: Request, re
     }
 
     const quoteResponse = await fetch(
-      `https://api.jup.ag/swap/v1/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100`,
+      `https://api.jup.ag/swap/v1/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100&asLegacyTransaction=true`,
       { headers: jupiterHeaders }
     );
 
@@ -1774,7 +1774,8 @@ router.post('/cleanup/swap/build', dammLiquidityLimiter, async (req: Request, re
         userPublicKey: lpOwner.publicKey.toBase58(),
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 'auto'
+        prioritizationFeeLamports: 'auto',
+        asLegacyTransaction: true
       })
     });
 
