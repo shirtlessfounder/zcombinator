@@ -162,71 +162,50 @@ const RESTRICTED_LP_OWNER = 'Hq7Xh37tT4sesD6wA4DphYfxeMJRhhFWS3KVUSSGjqzc';
 
 /**
  * Get the manager wallet address for a specific pool
- * Supports per-pool manager wallets via environment variables
- *
- * Environment variable priority:
- * 1. MANAGER_WALLET_<POOL_TICKER> - Pool-specific manager (e.g., MANAGER_WALLET_ZC)
- * 2. MANAGER_WALLET - Default/fallback manager wallet
+ * Requires pool-specific MANAGER_WALLET_<TICKER> environment variable
  *
  * @param poolAddress - The DAMM pool address
  * @returns Manager wallet public key string
+ * @throws Error if pool not in whitelist or env var not configured
  */
 function getManagerWalletForPool(poolAddress: string): string {
-  // Get ticker for this pool
   const ticker = poolToTicker[poolAddress];
 
-  // Try pool-specific manager wallet first
-  if (ticker) {
-    const poolSpecificManager = process.env[`MANAGER_WALLET_${ticker}`];
-    if (poolSpecificManager) {
-      console.log(`Using pool-specific manager for ${ticker}:`, poolSpecificManager);
-      return poolSpecificManager;
-    }
+  if (!ticker) {
+    throw new Error(`Pool ${poolAddress} not found in whitelist`);
   }
 
-  // Fallback to default manager wallet
-  const defaultManager = process.env.MANAGER_WALLET;
-  if (!defaultManager) {
-    throw new Error('MANAGER_WALLET environment variable not configured');
+  const poolSpecificManager = process.env[`MANAGER_WALLET_${ticker}`];
+  if (!poolSpecificManager) {
+    throw new Error(`MANAGER_WALLET_${ticker} environment variable not configured`);
   }
 
-  console.log(`Using default manager wallet:`, defaultManager);
-  return defaultManager;
+  console.log(`Using manager wallet for ${ticker}:`, poolSpecificManager);
+  return poolSpecificManager;
 }
 
 /**
  * Get the LP owner private key for a specific pool
- * Supports per-pool LP owners via environment variables
- *
- * Environment variable priority:
- * 1. LP_OWNER_PRIVATE_KEY_<POOL_TICKER> - Pool-specific LP owner (e.g., LP_OWNER_PRIVATE_KEY_ZC)
- * 2. LP_OWNER_PRIVATE_KEY - Default LP owner
- * 3. PROTOCOL_PRIVATE_KEY - Legacy fallback
+ * Requires pool-specific LP_OWNER_PRIVATE_KEY_<TICKER> environment variable
  *
  * @param poolAddress - The DAMM pool address
  * @returns LP owner private key (base58 encoded)
+ * @throws Error if pool not in whitelist or env var not configured
  */
 function getLpOwnerPrivateKeyForPool(poolAddress: string): string {
-  // Get ticker for this pool
   const ticker = poolToTicker[poolAddress];
 
-  // Try pool-specific LP owner first
-  if (ticker) {
-    const poolSpecificLpOwner = process.env[`LP_OWNER_PRIVATE_KEY_${ticker}`];
-    if (poolSpecificLpOwner) {
-      console.log(`Using pool-specific LP owner for ${ticker}`);
-      return poolSpecificLpOwner;
-    }
+  if (!ticker) {
+    throw new Error(`Pool ${poolAddress} not found in whitelist`);
   }
 
-  // Fallback to default LP owner
-  const defaultLpOwner = process.env.LP_OWNER_PRIVATE_KEY || process.env.PROTOCOL_PRIVATE_KEY;
-  if (!defaultLpOwner) {
-    throw new Error('LP_OWNER_PRIVATE_KEY environment variable not configured');
+  const poolSpecificLpOwner = process.env[`LP_OWNER_PRIVATE_KEY_${ticker}`];
+  if (!poolSpecificLpOwner) {
+    throw new Error(`LP_OWNER_PRIVATE_KEY_${ticker} environment variable not configured`);
   }
 
-  console.log(`Using default LP owner`);
-  return defaultLpOwner;
+  console.log(`Using LP owner for ${ticker}`);
+  return poolSpecificLpOwner;
 }
 
 // Clean up expired requests every 5 minutes
