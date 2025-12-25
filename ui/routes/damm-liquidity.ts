@@ -1749,7 +1749,7 @@ router.post('/cleanup/swap/build', dammLiquidityLimiter, async (req: Request, re
     }
 
     const quoteResponse = await fetch(
-      `https://quote-api.jup.ag/v6/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100`,
+      `https://api.jup.ag/swap/v1/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100`,
       { headers: jupiterHeaders }
     );
 
@@ -1766,7 +1766,7 @@ router.post('/cleanup/swap/build', dammLiquidityLimiter, async (req: Request, re
     console.log(`  Jupiter quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
 
     // Fetch Jupiter swap transaction
-    const swapResponse = await fetch('https://quote-api.jup.ag/v6/swap', {
+    const swapResponse = await fetch('https://api.jup.ag/swap/v1/swap', {
       method: 'POST',
       headers: jupiterHeaders,
       body: JSON.stringify({

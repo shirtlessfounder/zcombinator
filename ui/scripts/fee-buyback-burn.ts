@@ -59,7 +59,7 @@ const CONFIG = {
   SOL_RESERVE_LAMPORTS: BigInt(100_000_000),
 
   // Jupiter API
-  JUPITER_API_URL: 'https://quote-api.jup.ag/v6',
+  JUPITER_API_URL: 'https://api.jup.ag/swap/v1',
 
   // Slippage tolerance (in basis points, 100 = 1%)
   SLIPPAGE_BPS: 100,
