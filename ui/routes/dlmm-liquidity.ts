@@ -1915,8 +1915,11 @@ router.post('/cleanup/swap/build', dlmmLiquidityLimiter, async (req: Request, re
       });
     }
 
-    // Fetch Jupiter quote
-    console.log('  Fetching Jupiter quote...');
+    // Try Jupiter first, fallback to direct DLMM swap
+    let swapTransaction: Transaction;
+    let expectedOutputAmount: string;
+    let swapSource: 'jupiter' | 'dlmm';
+
     const jupiterHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
     };
@@ -1924,57 +1927,130 @@ router.post('/cleanup/swap/build', dlmmLiquidityLimiter, async (req: Request, re
       jupiterHeaders['x-api-key'] = JUP_API_KEY;
     }
 
-    const quoteResponse = await fetch(
-      `https://api.jup.ag/swap/v1/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100&asLegacyTransaction=true`,
-      { headers: jupiterHeaders }
-    );
+    // Helper to fetch with timeout
+    const fetchWithTimeout = async (url: string, options: RequestInit, timeoutMs: number = 10000) => {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, { ...options, signal: controller.signal });
+        clearTimeout(timeout);
+        return response;
+      } catch (error: any) {
+        clearTimeout(timeout);
+        if (error.name === 'AbortError') {
+          throw new Error(`Request timed out after ${timeoutMs}ms`);
+        }
+        throw error;
+      }
+    };
 
-    if (!quoteResponse.ok) {
-      return res.status(500).json({
-        error: 'Failed to fetch Jupiter quote',
-        details: await quoteResponse.text()
-      });
+    try {
+      // Attempt Jupiter swap
+      console.log('  Fetching Jupiter quote...');
+      const quoteUrl = `https://api.jup.ag/swap/v1/quote?inputMint=${swapInputMint.toBase58()}&outputMint=${swapOutputMint.toBase58()}&amount=${swapInputAmount.toString()}&slippageBps=100&asLegacyTransaction=true`;
+
+      const quoteResponse = await fetchWithTimeout(quoteUrl, { headers: jupiterHeaders }, 10000);
+
+      if (!quoteResponse.ok) {
+        const errorText = await quoteResponse.text();
+        console.log(`  Jupiter quote failed: ${quoteResponse.status} - ${errorText}`);
+        throw new Error(`Jupiter quote failed: ${quoteResponse.status}`);
+      }
+
+      const quoteData = await quoteResponse.json();
+
+      // Check for "no route" error
+      if (quoteData.error || quoteData.errorCode) {
+        console.log(`  Jupiter quote error: ${quoteData.error || quoteData.errorCode}`);
+        throw new Error(`Jupiter: ${quoteData.error || quoteData.errorCode}`);
+      }
+
+      expectedOutputAmount = quoteData.outAmount;
+      console.log(`  Jupiter quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
+
+      // Fetch Jupiter swap transaction
+      console.log('  Fetching Jupiter swap transaction...');
+      const swapResponse = await fetchWithTimeout('https://api.jup.ag/swap/v1/swap', {
+        method: 'POST',
+        headers: jupiterHeaders,
+        body: JSON.stringify({
+          quoteResponse: quoteData,
+          userPublicKey: lpOwner.publicKey.toBase58(),
+          wrapAndUnwrapSol: true,
+          dynamicComputeUnitLimit: true,
+          prioritizationFeeLamports: 'auto',
+          asLegacyTransaction: true
+        })
+      }, 15000);
+
+      if (!swapResponse.ok) {
+        const errorText = await swapResponse.text();
+        console.log(`  Jupiter swap failed: ${swapResponse.status} - ${errorText}`);
+        throw new Error(`Jupiter swap failed: ${swapResponse.status}`);
+      }
+
+      const swapData = await swapResponse.json();
+      const swapTransactionBase64 = swapData.swapTransaction;
+
+      // Decode the swap transaction
+      const swapTransactionBuffer = Buffer.from(swapTransactionBase64, 'base64');
+      swapTransaction = Transaction.from(swapTransactionBuffer);
+
+      // Set transaction properties
+      const { blockhash } = await connection.getLatestBlockhash();
+      swapTransaction.recentBlockhash = blockhash;
+      swapTransaction.feePayer = manager;
+      swapSource = 'jupiter';
+      console.log('  ✓ Jupiter swap transaction built successfully');
+
+    } catch (jupiterError: any) {
+      // Fallback to direct DLMM swap
+      console.log(`  Jupiter failed: ${jupiterError.message}`);
+      console.log('  Falling back to direct DLMM swap...');
+
+      try {
+        // Get bin arrays for the swap direction
+        const swapForY = swapDirection === 'XtoY';
+        const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+
+        if (!binArrays || binArrays.length === 0) {
+          throw new Error('No bin arrays available for swap');
+        }
+
+        // Get swap quote from DLMM
+        const slippageBps = new BN(100); // 1% slippage
+        const swapQuote = dlmmPool.swapQuote(swapInputAmount, swapForY, slippageBps, binArrays);
+
+        expectedOutputAmount = swapQuote.outAmount.toString();
+        console.log(`  DLMM quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
+
+        // Build DLMM swap transaction
+        swapTransaction = await dlmmPool.swap({
+          inToken: swapInputMint,
+          outToken: swapOutputMint,
+          inAmount: swapInputAmount,
+          minOutAmount: swapQuote.minOutAmount,
+          lbPair: poolAddress,
+          user: lpOwner.publicKey,
+          binArraysPubkey: swapQuote.binArraysPubkey,
+        });
+
+        // Set transaction properties
+        const { blockhash } = await connection.getLatestBlockhash();
+        swapTransaction.recentBlockhash = blockhash;
+        swapTransaction.feePayer = manager;
+        swapSource = 'dlmm';
+        console.log('  ✓ DLMM swap transaction built successfully');
+
+      } catch (dlmmError: any) {
+        console.log(`  DLMM swap also failed: ${dlmmError.message}`);
+        return res.status(500).json({
+          error: 'Both Jupiter and DLMM swap failed',
+          jupiterError: jupiterError.message,
+          dlmmError: dlmmError.message
+        });
+      }
     }
-
-    const quoteData = await quoteResponse.json();
-    const expectedOutputAmount = quoteData.outAmount;
-
-    console.log(`  Jupiter quote: ${swapInputAmount.toString()} → ${expectedOutputAmount}`);
-
-    // Fetch Jupiter swap transaction
-    const swapResponse = await fetch('https://api.jup.ag/swap/v1/swap', {
-      method: 'POST',
-      headers: jupiterHeaders,
-      body: JSON.stringify({
-        quoteResponse: quoteData,
-        userPublicKey: lpOwner.publicKey.toBase58(),
-        wrapAndUnwrapSol: true,
-        dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: 'auto',
-        asLegacyTransaction: true
-      })
-    });
-
-    if (!swapResponse.ok) {
-      return res.status(500).json({
-        error: 'Failed to fetch Jupiter swap transaction',
-        details: await swapResponse.text()
-      });
-    }
-
-    const swapData = await swapResponse.json();
-    const swapTransactionBase64 = swapData.swapTransaction;
-
-    // Decode the swap transaction
-    const swapTransactionBuffer = Buffer.from(swapTransactionBase64, 'base64');
-    const swapTransaction = Transaction.from(swapTransactionBuffer);
-
-    // Set transaction properties
-    const { blockhash } = await connection.getLatestBlockhash();
-
-    // Update swap transaction with manager as fee payer
-    swapTransaction.recentBlockhash = blockhash;
-    swapTransaction.feePayer = manager;
 
     // Serialize transaction
     const unsignedSwapTx = bs58.encode(swapTransaction.serialize({ requireAllSignatures: false }));
@@ -1983,10 +2059,11 @@ router.post('/cleanup/swap/build', dlmmLiquidityLimiter, async (req: Request, re
     // Generate request ID
     const requestId = crypto.randomBytes(16).toString('hex');
 
-    console.log('✓ Cleanup swap transaction built successfully');
+    console.log(`✓ Cleanup swap transaction built successfully (via ${swapSource.toUpperCase()})`);
     console.log(`  Pool: ${poolAddress.toBase58()}`);
     console.log(`  Swap: ${swapInputAmount.toString()} ${swapDirection === 'XtoY' ? 'X→Y' : 'Y→X'}`);
     console.log(`  Expected output: ${expectedOutputAmount}`);
+    console.log(`  Swap source: ${swapSource}`);
     console.log(`  Request ID: ${requestId}`);
 
     // Store request data
