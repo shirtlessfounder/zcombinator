@@ -577,8 +577,9 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
       // If redepositing native SOL, we need to wrap it first
       // After withdrawal with skipUnwrapSOL: false, SOL is in native balance
       // addLiquidityByStrategy expects wSOL in ATA
-      if (isTokenXNativeSOL && !redepositTokenXAmount.isZero()) {
-        // Ensure wSOL ATA exists
+      // Ensure wSOL ATAs exist - addLiquidityByStrategy requires both token accounts
+      // to be initialized even if depositing 0 of one token
+      if (isTokenXNativeSOL) {
         redepositTx.add(
           createAssociatedTokenAccountIdempotentInstruction(
             lpOwner.publicKey,
@@ -587,19 +588,20 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
             NATIVE_MINT
           )
         );
-        // Transfer native SOL to wSOL ATA and sync
-        redepositTx.add(
-          SystemProgram.transfer({
-            fromPubkey: lpOwner.publicKey,
-            toPubkey: lpOwnerTokenXAta,
-            lamports: Number(redepositTokenXAmount.toString())
-          }),
-          createSyncNativeInstruction(lpOwnerTokenXAta)
-        );
+        // Transfer native SOL to wSOL ATA and sync (only if amount > 0)
+        if (!redepositTokenXAmount.isZero()) {
+          redepositTx.add(
+            SystemProgram.transfer({
+              fromPubkey: lpOwner.publicKey,
+              toPubkey: lpOwnerTokenXAta,
+              lamports: Number(redepositTokenXAmount.toString())
+            }),
+            createSyncNativeInstruction(lpOwnerTokenXAta)
+          );
+        }
       }
 
-      if (isTokenYNativeSOL && !redepositTokenYAmount.isZero()) {
-        // Ensure wSOL ATA exists
+      if (isTokenYNativeSOL) {
         redepositTx.add(
           createAssociatedTokenAccountIdempotentInstruction(
             lpOwner.publicKey,
@@ -608,15 +610,17 @@ router.post('/withdraw/build', dlmmLiquidityLimiter, async (req: Request, res: R
             NATIVE_MINT
           )
         );
-        // Transfer native SOL to wSOL ATA and sync
-        redepositTx.add(
-          SystemProgram.transfer({
-            fromPubkey: lpOwner.publicKey,
-            toPubkey: lpOwnerTokenYAta,
-            lamports: Number(redepositTokenYAmount.toString())
-          }),
-          createSyncNativeInstruction(lpOwnerTokenYAta)
-        );
+        // Transfer native SOL to wSOL ATA and sync (only if amount > 0)
+        if (!redepositTokenYAmount.isZero()) {
+          redepositTx.add(
+            SystemProgram.transfer({
+              fromPubkey: lpOwner.publicKey,
+              toPubkey: lpOwnerTokenYAta,
+              lamports: Number(redepositTokenYAmount.toString())
+            }),
+            createSyncNativeInstruction(lpOwnerTokenYAta)
+          );
+        }
       }
 
       // Build add liquidity transaction for the excess tokens
