@@ -42,9 +42,10 @@ import rateLimit from 'express-rate-limit';
 const router = Router();
 
 // Rate limiter for DAMM liquidity endpoints
+// A full cleanup flow needs 6 requests: withdraw build/confirm, swap build/confirm, deposit build/confirm
 const dammLiquidityLimiter = rateLimit({
   windowMs: 5 * 60 * 1000, // 5 minutes
-  max: 10, // 10 requests per 5 minutes
+  max: 300, // 300 requests per 5 minutes
   standardHeaders: true,
   legacyHeaders: false,
   message: 'Too many liquidity requests, please wait a moment.'
