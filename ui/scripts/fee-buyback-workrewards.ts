@@ -417,6 +417,17 @@ async function claimFeesFromDlmmPool(
 // JUPITER SWAP FUNCTIONS
 // ============================================================================
 
+function getJupiterHeaders(): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  };
+  const JUP_API_KEY = process.env.JUP_API_KEY;
+  if (JUP_API_KEY) {
+    headers['x-api-key'] = JUP_API_KEY;
+  }
+  return headers;
+}
+
 async function getJupiterQuote(
   inputMint: string,
   outputMint: string,
@@ -429,7 +440,9 @@ async function getJupiterQuote(
     slippageBps: CONFIG.SLIPPAGE_BPS.toString(),
   });
 
-  const response = await fetch(`${CONFIG.JUPITER_API_URL}/quote?${params}`);
+  const response = await fetch(`${CONFIG.JUPITER_API_URL}/quote?${params}`, {
+    headers: getJupiterHeaders(),
+  });
 
   if (!response.ok) {
     throw new Error(`Failed to get Jupiter quote: ${response.statusText}`);
@@ -444,9 +457,7 @@ async function getJupiterSwapTransaction(
 ): Promise<JupiterSwapResponse> {
   const response = await fetch(`${CONFIG.JUPITER_API_URL}/swap`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: getJupiterHeaders(),
     body: JSON.stringify({
       quoteResponse,
       userPublicKey,
